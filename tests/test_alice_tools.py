@@ -109,7 +109,7 @@ class AliceToolsTests(unittest.TestCase):
         self.assertEqual(sibling.read_bytes(), b"UNRELATED")
         args = json.loads(self.log.read_text(encoding="utf-8"))
         output = Path(args[args.index("-o") + 1])
-        self.assertEqual(output.parent.parent, self.ain.parent)
+        self.assertEqual(output.parent.parent, self.ain.parent.resolve())
         self.assertFalse(output.parent.exists())
 
     def test_failed_save_preserves_source_and_previous_backup(self):

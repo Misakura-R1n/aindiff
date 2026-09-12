@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Vendored upstream binary (download with `python -m aindiff fetch-alice`)
+vendor/alice/alice.exe
+vendor/alice/alice
+vendor/alice/alice-tools-*.zip
+
+# Backups created when writing back to original .ain files
+*.ain.bak
+*.bak
+
+# IDE / OS
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
+
+# Standalone release archive
+release/
+
+# 本地交接、审查记录和游戏数据
+/HANDOFF.md
+/docs/code-review.md
+*.ain
+*.ain-new
+*.tsv
+
+# 本地凭据与环境设置
+.env
+.env.*
+!.env.example
+*.pem
+*.key

@@ -27,6 +27,7 @@ __all__ = [
     "TEXT_SECTION_KINDS",
     "build_section_dump",
     "load_section_dump",
+    "load_section_map",
     "load_text_section_with_fallback",
     "parse_section_map",
     "text_section_names",
@@ -134,9 +135,9 @@ def build_section_dump(
     encoding: str,
     data: bytes,
     *,
-    errors: str = "replace",
+    errors: str = "strict",
 ) -> TextDump:
-    """Build a TextDump; use strict decoding when probing candidate encodings."""
+    """Build an editable TextDump without silently replacing invalid bytes."""
 
     kind = TEXT_SECTION_KINDS.get(section_name)
     if kind is None:
@@ -162,7 +163,7 @@ def build_section_dump(
     return TextDump(path=str(path), encoding=encoding, sections=[section_name], entries=entries)
 
 
-def _load_section_map(
+def load_section_map(
     tools: object, path: str, encodings: Sequence[str]
 ) -> List[SectionInfo]:
     last_error: Optional[Exception] = None
@@ -200,7 +201,7 @@ def load_section_dump(
     sections = (
         parse_section_map(section_map_text)
         if section_map_text is not None
-        else _load_section_map(tools, path, (encoding, "CP932", "CP936", "UTF-8"))
+        else load_section_map(tools, path, (encoding, "CP932", "CP936", "UTF-8"))
     )
     section = next((s for s in sections if s.name == section_name), None)
     if section is None:
@@ -224,7 +225,7 @@ def text_section_names(
 
     encodings = tuple(map_encodings or ("CP932", "CP936", "UTF-8"))
     return [
-        s.name for s in _load_section_map(tools, path, encodings) if s.name in TEXT_SECTION_KINDS
+        s.name for s in load_section_map(tools, path, encodings) if s.name in TEXT_SECTION_KINDS
     ]
 
 
@@ -244,7 +245,7 @@ def load_text_section_with_fallback(
     text).  ``alice-tools`` accepts only one global input encoding, so
     ``ain dump -t`` cannot convert such a file at all.  Reading one raw text
     section straight from the decrypted image still works, which keeps those
-    files readable and editable.
+    files readable. Saving still depends on alice-tools accepting the encoding.
 
     Either pass an explicit *section_name* or let the *section_names*
     preference order decide.  The chosen section is reported through
@@ -252,7 +253,7 @@ def load_text_section_with_fallback(
     """
 
     preferred = tuple(section_names or ("MSG0", "MSG1", "STR0"))
-    sections = _load_section_map(tools, path, map_encodings or ("CP932", "CP936", "UTF-8"))
+    sections = load_section_map(tools, path, map_encodings or ("CP932", "CP936", "UTF-8"))
     available = {s.name: s for s in sections if s.name in TEXT_SECTION_KINDS}
     if section_name is not None:
         if section_name not in available:

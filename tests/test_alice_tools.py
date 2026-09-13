@@ -9,7 +9,8 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from aindiff.alice_tools import AliceError, AliceTools
+from aindiff.alice_tools import AliceError, AliceRunError, AliceTools, _byte_preserving_edit
+from aindiff.model import escape_text, parse_dump
 
 
 def _write_fake_alice(tmp: Path) -> Path:
@@ -61,6 +62,70 @@ raise SystemExit(2)
 
 
 class AliceToolsTests(unittest.TestCase):
+    def test_transport_preserves_encoded_bytes_and_comments(self):
+        for encoding, text in (
+            ("CP936", '中文あ乗\n\r\t\b\f"\\'),
+            ("CP932", '日本語ソ表\n"\\'),
+            ("UTF-8", '中文😀\u2028'),
+        ):
+            with self.subTest(encoding=encoding):
+                patch_text = ';m[9] = "ignored"\n' + f'm[2] = "{escape_text(text)}"\n'
+                transported = parse_dump(_byte_preserving_edit(patch_text, encoding))
+                self.assertEqual(len(transported.entries), 1)
+                self.assertEqual(transported.entries[0].index, 2)
+                self.assertEqual(transported.entries[0].text.encode("latin1"), text.encode(encoding))
+
+    def test_transport_rejects_invalid_or_unrepresentable_changes(self):
+        for edit, encoding in (
+            ('m[0] = "😀"\n', "CP936"),
+            ('m[0] = "nul\0"\n', "UTF-8"),
+            ('s["key"] = "value"\n', "CP936"),
+            ('invalid\n', "CP936"),
+            ('m[0] = "' + "a" * 65536 + '"\n', "CP936"),
+        ):
+            with self.subTest(encoding=encoding), self.assertRaises(AliceError):
+                _byte_preserving_edit(edit, encoding)
+
+    def test_iconv_failure_retries_using_byte_transport(self):
+        text = '中文乗\n"\\'
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append(list(args))
+            output = Path(args[args.index("-o") + 1])
+            if len(calls) == 1:
+                output.write_bytes(b"PARTIAL")
+                raise AliceRunError("ERROR: iconv: Invalid argument")
+            self.assertFalse(output.exists())
+            self.assertEqual(args[args.index("--output-encoding") + 1], "ISO-8859-1")
+            edit = Path(args[args.index("-t") + 1]).read_text(encoding="utf-8")
+            entry = parse_dump(edit).entries[0]
+            self.assertEqual(entry.text.encode("latin1"), text.encode("CP936"))
+            output.write_bytes(b"SAVED")
+
+        with patch.object(self.tools, "run", side_effect=run):
+            self.tools.edit_text(self.ain, f'm[0] = "{escape_text(text)}"\n', "CP936")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.ain.read_bytes(), b"SAVED")
+        self.assertEqual(self.ain.with_suffix(".ain.bak").read_bytes(), b"ORIGINAL")
+
+    def test_failed_retry_preserves_original_and_backup(self):
+        backup = self.ain.with_suffix(".ain.bak")
+        backup.write_bytes(b"OLD BACKUP")
+        with patch.object(self.tools, "run", side_effect=AliceRunError("iconv: failed")) as run:
+            with self.assertRaises(AliceRunError):
+                self.tools.edit_text(self.ain, 'm[0] = "text"\n', "CP936")
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(self.ain.read_bytes(), b"ORIGINAL")
+        self.assertEqual(backup.read_bytes(), b"OLD BACKUP")
+        self.assertEqual(list(self.ain.parent.glob(".aindiff-edit-*")), [])
+
+    def test_other_alice_errors_do_not_retry(self):
+        with patch.object(self.tools, "run", side_effect=AliceRunError("Invalid index")) as run:
+            with self.assertRaises(AliceRunError):
+                self.tools.edit_text(self.ain, 'm[0] = "text"\n', "CP936")
+        run.assert_called_once()
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

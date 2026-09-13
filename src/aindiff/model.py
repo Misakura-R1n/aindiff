@@ -31,10 +31,31 @@ __all__ = [
     "escape_text",
     "normalize_search_text",
     "parse_dump",
+    "parse_edit_text",
     "unescape_text",
 ]
 
 _ASSIGN_RE = re.compile(r'^;?([sm])\[(\d+)\]\s*=\s*"(.*)"$')
+_EDIT_RE = re.compile(r'([sm])\[(\d+)\]\s*=\s*"((?:[^"\\]|\\.)*)"\s*(?:;.*)?')
+
+
+def parse_edit_text(text: str) -> Dict[Tuple[str, int], str]:
+    """Read numeric edit assignments strictly; comments are never applied.
+
+    Repeated IDs use the last value, matching alice. Dump parsing intentionally
+    has different semantics because commented assignments are readable data.
+    """
+    assignments: Dict[Tuple[str, int], str] = {}
+    for number, raw_line in enumerate(text.split("\n"), 1):
+        line = raw_line.strip()
+        if not line or line.startswith(";"):
+            continue
+        match = _EDIT_RE.fullmatch(line)
+        if match is None:
+            raise ValueError(f"编辑文本第 {number} 行语法无效（仅支持数字 ID 赋值）")
+        kind, index, body = match.groups()
+        assignments[(kind, int(index))] = unescape_text(body)
+    return assignments
 
 
 class EntryConflict(ValueError):

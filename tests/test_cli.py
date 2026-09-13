@@ -182,7 +182,7 @@ class CliTests(unittest.TestCase):
         tools = Mock()
         tools.map_dump.return_value = f"STR0: 00000000 -> {len(payload):08x}\n"
         tools.decrypted_bytes.return_value = payload
-        with patch.object(cli, "_open_dump_with_fallback", side_effect=[(left, "STR0"), (right, "MSG0")]):
+        with patch("aindiff.loading.open_dump_with_fallback", side_effect=[(left, "STR0"), (right, "MSG0")]):
             _, right_dump, rows, notes = cli._load_pair(
                 tools, str(self.normal), str(self.mixed), None, None
             )

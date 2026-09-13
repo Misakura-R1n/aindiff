@@ -1,7 +1,7 @@
 # 与 alice-tools 的结合点
 
-本项目不解析 AIN 二进制格式，所有底层操作委托给
-[nunuhara/alice-tools](https://github.com/nunuhara/alice-tools) 的 `alice` CLI。
+System4 的容器读写委托给 [nunuhara/alice-tools](https://github.com/nunuhara/alice-tools) 的 `alice` CLI，
+本项目解析其区段表及解密后的文本区段；旧 AINI/AIN2 使用内置解析器。
 本文记录每个调用与上游源码的对应关系，便于升级或排错。
 
 ## 使用的命令
@@ -36,6 +36,25 @@
 - 对中文汉化 AIN（文本字节为 CP936），必须给 `ain dump` 传
   `--input-encoding CP936`，给 `ain edit` 传 `--output-encoding CP936`；
   这正是本工具把每个文件的探测编码保存下来并在写回时复用的原因。
+
+## 混合编码写回（v0.4.6）
+
+alice 0.13.0 的 [ain_edit.c](https://github.com/nunuhara/alice-tools/blob/0.13.0/src/cli/ain_edit.c)
+在应用文本修改前调用 `ain_init_member_functions(ain, conv_output_utf8)`，按输出编码解码函数名。
+因此 CP932 函数名与 CP936 正文混合时，即使只修改消息，也可能先触发 `iconv` 错误。
+
+`AliceTools.edit_text` 保留原流程，仅在 `AliceRunError` 包含 `iconv:` 时重试一次：
+
+1. 严格解析本程序生成的数字 ID 赋值，反转义后按实际目标编码生成字节。
+2. 将这些字节一一映射到 Latin-1 字符，重新转义并以 UTF-8 保存临时补丁。必须在字节映射后转义，避免 CP932/CP936 的反斜杠尾字节被当作语法。
+3. 使用 `--input-encoding UTF-8 --output-encoding ISO-8859-1` 交给 alice，得到原本所需的目标字节。Latin-1 仅用于临时传输，不改变用户选择或文件的实际文本编码。
+4. 重试前移除第一次失败产生的临时输出；成功生成非空文件后才备份并原子替换。
+
+函数名初始化能通过 Latin-1 解码，存储内容无需转码。实现仍使用上游写入器，未新增 System4 二进制写入器。
+参见上游 [text_lexer.l](https://github.com/nunuhara/alice-tools/blob/0.13.0/src/core/ain/text_lexer.l) 中的转义与 `conv_output` 处理。
+重试拒绝非法补丁、NUL、不可编码文本及超出上游固定字符串缓冲区的传输内容，不吞掉非编码错误。
+
+真实样本验证中，ランス０２同时修改 MSG0、STR0 后的完整解密数据与预期字节一致，恢复后也完全一致；这仍不等于游戏内运行验证。
 
 ## 升级上游
 

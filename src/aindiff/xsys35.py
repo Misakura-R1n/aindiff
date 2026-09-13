@@ -16,14 +16,13 @@ decompiler/ain.c).
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import struct
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-from .model import TextDump, TextEntry, escape_text, unescape_text
+from .model import TextDump, TextEntry, escape_text, parse_edit_text
 
 __all__ = [
     "MAGIC_AINI",
@@ -40,7 +39,6 @@ MAGIC_AINI = b"AINI"
 MAGIC_AIN2 = b"AIN2"
 SECTION_KINDS = {"VARI": "s", "MSGI": "m"}
 KNOWN_SECTIONS = ("HEL0", "FUNC", "VARI", "MSGI")
-_EDIT_RE = re.compile(r'([sm])\[(\d+)\]\s*=\s*"((?:[^"\\]|\\.)*)"\s*(?:;.*)?')
 _DECRYPT_TABLE = bytes(((b << 2) | (b >> 6)) & 0xFF for b in range(256))
 _ENCRYPT_TABLE = bytes(((b >> 2) | (b << 6)) & 0xFF for b in range(256))
 
@@ -204,7 +202,7 @@ def _text_dump_sections(path: str, encoding: str) -> TextDump:
                     kind=kind,
                     index=index,
                     occurrence=1,
-                    text=raw.decode(encoding, errors="replace"),
+                    text=raw.decode(encoding),
                     section=name,
                     section_no=section_no,
                     line_no=index + 1,
@@ -245,7 +243,7 @@ def section_dump(path: str, section_name: str, encoding: str) -> TextDump:
             kind=SECTION_KINDS[name],
             index=index,
             occurrence=1,
-            text=raw.decode(encoding, errors="replace"),
+            text=raw.decode(encoding),
             section=name,
             section_no=0,
             line_no=index + 1,
@@ -289,16 +287,7 @@ def edit_file(
     data, payload = _load(str(path))
 
     # Apply assignment statements (last one wins, like alice-tools).
-    assignments: Dict[Tuple[str, int], str] = {}
-    for line_no, raw_line in enumerate(edit_text.split("\n"), start=1):
-        line = raw_line.strip()
-        if not line or line.startswith(";"):
-            continue
-        match = _EDIT_RE.fullmatch(line)
-        if match is None:
-            raise ValueError(f"AINI 编辑文本第 {line_no} 行语法无效")
-        kind, index, body = match.groups()
-        assignments[(kind, int(index))] = unescape_text(body)
+    assignments = parse_edit_text(edit_text)
 
     sections = parse_sections(payload)
     if not sections:

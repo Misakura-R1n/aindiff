@@ -14,8 +14,19 @@ from aindiff.model import (
     escape_text,
     normalize_search_text,
     parse_dump,
+    parse_edit_text,
     unescape_text,
 )
+
+
+class EditSyntaxTests(unittest.TestCase):
+    def test_comments_duplicates_and_escaped_separators(self):
+        text = ';s[9] = "ignored"\ns[1] = "first"\ns[1] = "last\\n\\t\u2028" ; comment\n'
+        self.assertEqual(parse_edit_text(text), {("s", 1): "last\n\t\u2028"})
+
+    def test_invalid_assignment_is_not_silently_skipped(self):
+        with self.assertRaisesRegex(ValueError, "第 2 行"):
+            parse_edit_text('s[1] = "valid"\ns[bad] = "invalid"\n')
 
 # Raw string keeps the dump-format backslash escapes literally.
 SAMPLE = r"""; main

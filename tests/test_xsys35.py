@@ -56,6 +56,15 @@ class Xsys35Tests(unittest.TestCase):
         self.assertEqual(dump.sections, ["MSGI"])
         self.assertEqual([e.text for e in dump.entries], ["", "ランス"])
 
+    def test_invalid_selected_encoding_rejects_full_and_section_reads(self):
+        for reader in (
+            lambda: xsys35.text_dump(str(self.path), "ascii"),
+            lambda: xsys35.dump_text_syntax(str(self.path), "ascii"),
+            lambda: xsys35.section_dump(str(self.path), "MSGI", "ascii"),
+        ):
+            with self.subTest(reader=reader), self.assertRaises(UnicodeDecodeError):
+                reader()
+
     def test_map_text(self):
         text = xsys35.map_text(str(self.path))
         self.assertIn("VARI:", text)

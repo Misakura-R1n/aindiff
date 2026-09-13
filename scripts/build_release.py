@@ -8,11 +8,12 @@ Produces the extract-and-run zip in ``release/`` from the current checkout:
 Prerequisites:
 * Python with tkinter
 * PyInstaller (``python -m pip install pyinstaller``)
-* ``vendor/alice/alice.exe`` (fetch with ``python -m aindiff fetch-alice``)
+* ``vendor/alice/alice.exe`` (copy from the cache printed by ``fetch-alice``)
 """
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import subprocess
 import sys
@@ -34,12 +35,14 @@ def run(cmd: list[str]) -> None:
 def main() -> int:
     alice = ROOT / "vendor" / "alice" / "alice.exe"
     if not alice.is_file():
-        print("缺少 vendor/alice/alice.exe。请先运行：python -m aindiff fetch-alice", file=sys.stderr)
+        print(
+            "缺少 vendor/alice/alice.exe。请运行 python -m aindiff fetch-alice，"
+            "再将提示的缓存目录中的 alice.exe 复制到 vendor/alice/alice.exe。",
+            file=sys.stderr,
+        )
         return 1
 
     dist = ROOT / "dist" / "aindiff"
-    if dist.exists():
-        shutil.rmtree(dist)
 
     run(
         [
@@ -48,14 +51,7 @@ def main() -> int:
             "PyInstaller",
             "--noconfirm",
             "--clean",
-            "--windowed",
-            "--name",
-            "aindiff",
-            "--paths",
-            "src",
-            "--add-data",
-            "vendor/alice/alice.exe;vendor/alice",
-            "scripts/launcher.py",
+            "aindiff.spec",
         ]
     )
 
@@ -65,7 +61,7 @@ def main() -> int:
     for name in ("README.md", "CHANGELOG.md", "CONTRIBUTING.md", "LICENSE"):
         shutil.copy2(ROOT / name, dist / name)
     (dist / "docs").mkdir(exist_ok=True)
-    for name in ("usage.md", "development.md"):
+    for name in ("usage.md", "development.md", "alice-tools-integration.md"):
         shutil.copy2(ROOT / "docs" / name, dist / "docs" / name)
     shutil.copy2(ROOT / "LICENSE", dist / "LICENSE.txt")
     licenses = dist / "licenses" / "alice-tools"
@@ -83,7 +79,14 @@ def main() -> int:
             if file.is_file():
                 zf.write(file, Path(base) / file.relative_to(dist))
 
+    digest = hashlib.sha256()
+    with zip_path.open("rb") as archive:
+        for chunk in iter(lambda: archive.read(1024 * 1024), b""):
+            digest.update(chunk)
+    checksum_path = zip_path.with_suffix(".zip.sha256")
+    checksum_path.write_text(f"{digest.hexdigest()}  {zip_path.name}\n", encoding="ascii")
     print(f"release: {zip_path} ({zip_path.stat().st_size} bytes)")
+    print(f"checksum: {checksum_path}")
     return 0
 
 

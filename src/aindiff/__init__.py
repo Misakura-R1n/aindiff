@@ -5,7 +5,7 @@ official `alice-tools` project (https://github.com/nunuhara/alice-tools).
 This package provides the comparison model and GUI/CLI on top of it.
 """
 
-__version__ = "0.4.3"
+__version__ = "0.4.8"
 
 APP_NAME = "AinDiff 双栏文本编辑"
 ALICE_TOOLS_URL = "https://github.com/nunuhara/alice-tools"

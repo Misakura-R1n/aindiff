@@ -9,6 +9,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from aindiff.ain_sections import (  # noqa: E402
     SectionInfo,
     build_section_dump,
+    load_section_dump,
     load_text_section_with_fallback,
     parse_section_map,
     text_section_names,
@@ -82,9 +83,8 @@ class RawSectionTests(unittest.TestCase):
         table = cstring_table(["ｱ"], encoding="cp932")
         with self.assertRaises(UnicodeDecodeError):
             build_section_dump("x.ain", "MSG0", "CP936", table, errors="strict")
-        # A manually selected encoding remains permissive for mixed tables.
-        dump = build_section_dump("x.ain", "MSG0", "CP936", table)
-        self.assertEqual(dump.entries[0].text, "\ufffd")
+        with self.assertRaises(UnicodeDecodeError):
+            build_section_dump("x.ain", "MSG0", "CP936", table)
 
     def test_strict_decoding_rejects_invalid_msg1_bytes(self):
         encoded = bytes([(0xB1 + 0x60) & 0xFF])
@@ -145,6 +145,13 @@ class TextSectionNamesTests(unittest.TestCase):
 
 
 class FallbackLoadTests(unittest.TestCase):
+    def test_direct_section_load_rejects_invalid_selected_encoding(self):
+        tools = self._tools("ｱ", encoding="cp932")
+        with self.assertRaises(UnicodeDecodeError):
+            load_section_dump(tools, "x.ain", "MSG0", "CP936")
+        dump = load_section_dump(tools, "x.ain", "MSG0", "CP932")
+        self.assertEqual(dump.entries[0].text, "ｱ")
+
     def _tools(self, text="hello", encoding="utf-8"):
         table = cstring_table([text], encoding=encoding)
         # MSG0 must span exactly the encoded table, so derive its end offset.

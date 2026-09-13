@@ -174,6 +174,10 @@ class AinDiffApp(tk.Tk):
         _enable_windows_dpi_awareness()
         super().__init__()
         self.title(f"{APP_NAME}  v{__version__}")
+        icon_path = Path(__file__).with_name("assets") / "aindiff.png"
+        if icon_path.is_file():
+            self._app_icon = tk.PhotoImage(file=str(icon_path))
+            self.iconphoto(True, self._app_icon)
         self.geometry("1280x800")
         self.minsize(900, 520)
         default_font = tkfont.nametofont("TkDefaultFont")

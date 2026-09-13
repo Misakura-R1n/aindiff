@@ -68,6 +68,12 @@ GUI 后台任务只读取快照参数并生成模型，不调用 Tk；主线程�
 编辑提交中必要的重筛、保存后的刷新仍同步执行，避免内部扫描使“全部保存”的第二侧被忙碌状态拦截；这些路径不承诺分批响应。
 `model.parse_edit_text` 是 AINI 与混合编码写回共用的严格补丁解析器；读取 dump 的注释语义不同，保留独立的 `parse_dump`。
 
+## 应用图标
+
+图标资源位于 `src/aindiff/assets/`。`aindiff-master.png` 是根据用户提供的角色设定生成并简化的头像源图，PNG 用于 Tk 窗口，ICO 用于 Windows 可执行文件，包含 16～256 像素共九种尺寸。
+源图与图标使用真实 Alpha 透明背景，不能用绘制棋盘格代替透明；转换脚本会检查透明通道。更新图形时替换方形源图 `aindiff-master.png`，安装 Pillow 后运行 `python scripts/build_icon.py` 同步生成窗口 PNG 和多尺寸 ICO；普通运行和发布构建无需 Pillow。
+源码安装通过 setuptools package-data 包含资源，独立发布包由 `aindiff.spec` 配置。
+
 ## 新增命令
 
 1. 在 `cli.build_parser()` 注册子命令。

@@ -382,24 +382,32 @@ def download_alice(
     zip_path = dest_dir / f"alice-tools-{ALICE_RELEASE_TAG}.zip"
     extract_dir = dest_dir / f"alice-tools-{ALICE_RELEASE_TAG}"
 
-    _download(url, zip_path, insecure=insecure)
+    # Validate in isolation before replacing any usable cached executable.
+    with tempfile.TemporaryDirectory(prefix=".aindiff-download-", dir=dest_dir) as td:
+        staged = Path(td)
+        archive = staged / "download.zip"
+        _download(url, archive, insecure=insecure)
+        try:
+            with zipfile.ZipFile(archive) as zf:
+                for member in zf.namelist():
+                    base = member.split("/", 1)[1] if "/" in member else member
+                    if base in ("alice.exe", "alice", "COPYING.txt"):
+                        with zf.open(member) as src, (staged / base).open("wb") as dst:
+                            shutil.copyfileobj(src, dst)
+        except zipfile.BadZipFile as exc:
+            raise AliceError("下载的 alice-tools ZIP 已损坏，请重新下载。") from exc
 
-    extract_dir.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path) as zf:
-        for member in zf.namelist():
-            base = member.split("/", 1)[1] if "/" in member else member
-            if not base:
-                continue
-            if base in ("alice.exe", "alice", "COPYING.txt"):
-                target = extract_dir / base
-                with zf.open(member) as src, open(target, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
-
+        staged_exe = staged / _EXE_NAME
+        if not staged_exe.is_file():
+            raise AliceError(f"下载包中未找到 {_EXE_NAME}：{url}")
+        if os.name != "nt":
+            staged_exe.chmod(0o755)
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("alice.exe", "alice", "COPYING.txt"):
+            if (staged / name).is_file():
+                os.replace(staged / name, extract_dir / name)
+        os.replace(archive, zip_path)
     exe = extract_dir / _EXE_NAME
-    if not exe.is_file():
-        raise AliceError(f"下载包中未找到 {_EXE_NAME}：{url}")
-    if os.name != "nt":
-        exe.chmod(0o755)
     return exe
 
 

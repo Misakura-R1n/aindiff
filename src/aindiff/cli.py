@@ -37,6 +37,13 @@ def _add_encoding_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--right-encoding", help="右侧 AIN 文本编码（默认自动识别）")
 
 
+def _nonnegative_int(value: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("必须是非负整数")
+    return number
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aindiff",
@@ -76,7 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_encoding_options(check)
     check.add_argument("left", help="左侧 .ain 文件")
     check.add_argument("right", help="右侧 .ain 文件")
-    check.add_argument("--max-diffs", type=int, default=20, help="最多显示多少条差异（默认 20）")
+    check.add_argument("--max-diffs", type=_nonnegative_int, default=20, help="最多显示多少条差异（默认 20）")
 
     fetch = sub.add_parser(
         "fetch-alice",

@@ -166,6 +166,33 @@ class CliTests(unittest.TestCase):
         self.assertIn("usage:", buf.getvalue())
         run_gui.assert_not_called()
 
+    def test_max_diffs_rejects_negative_before_loading(self):
+        with redirect_stderr(io.StringIO()), patch.object(cli, "_run_check") as check:
+            with self.assertRaises(SystemExit) as error:
+                cli.main(["check", "left.ain", "right.ain", "--max-diffs", "-1"])
+            self.assertEqual(error.exception.code, 2)
+            check.assert_not_called()
+
+    def test_max_diffs_accepts_zero_and_positive(self):
+        for limit in (0, 2):
+            with self.subTest(limit=limit), patch.object(cli, "_run_check", return_value=0) as check:
+                self.assertEqual(cli.main([
+                    "check", "left.ain", "right.ain", "--max-diffs", str(limit)
+                ]), 0)
+                self.assertEqual(check.call_args.args[0].max_diffs, limit)
+
+    def test_fetch_invalid_zip_reports_error_without_traceback(self):
+        def download(url, target, **kwargs):
+            target.write_bytes(b"invalid zip")
+
+        with patch("aindiff.alice_tools._download", side_effect=download):
+            output = io.StringIO()
+            with redirect_stderr(output):
+                code = cli.main(["fetch-alice", "--dest", self.tmp.name])
+        self.assertEqual(code, 1)
+        self.assertIn("ZIP 已损坏", output.getvalue())
+        self.assertNotIn("Traceback", output.getvalue())
+
     def test_one_sided_fallback_compares_matching_raw_tables(self):
         out_path = Path(self.tmp.name) / "out.tsv"
         code, _ = self._run(["export", str(self.mixed), str(self.normal), "-o", str(out_path)])

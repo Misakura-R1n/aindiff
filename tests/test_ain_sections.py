@@ -1,5 +1,6 @@
 import struct
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from aindiff.ain_sections import (  # noqa: E402
     parse_section_map,
     text_section_names,
 )
+from aindiff import xsys35  # noqa: E402
 
 MAP_TEXT = """VERS: 00000000 -> 00000008
 CODE: 00000008 -> 00000010
@@ -165,6 +167,25 @@ class FallbackLoadTests(unittest.TestCase):
         self.assertEqual(dump.sections, ["MSG0"])
         self.assertEqual(dump.encoding, "CP936")
         self.assertEqual([e.text for e in dump.entries], ["你好"])
+
+    def test_aini_fallback_uses_vari_and_msgi_sections(self):
+        def section(name, text, encoding):
+            return name + struct.pack("<II", 0, 1) + text.encode(encoding) + b"\0"
+
+        payload = section(b"VARI", "ｱ", "CP932") + section(b"MSGI", "选项", "CP936")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "mixed.ain"
+            path.write_bytes(b"AINI" + struct.pack("<I", 1) + xsys35._encrypt_payload(payload))
+
+            class Tools:
+                def map_dump(self, ain_path, _encoding):
+                    return xsys35.map_text(ain_path)
+
+            dump = load_text_section_with_fallback(Tools(), str(path))
+
+        self.assertEqual(dump.sections, ["VARI"])
+        self.assertEqual(dump.encoding, "CP932")
+        self.assertEqual(dump.entries[0].text, "ｱ")
 
     def test_explicit_section_is_honoured(self):
         dump = load_text_section_with_fallback(

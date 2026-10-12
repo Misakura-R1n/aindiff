@@ -252,7 +252,12 @@ def load_text_section_with_fallback(
     :attr:`TextDump.sections` so callers can show which view they got.
     """
 
-    preferred = tuple(section_names or ("MSG0", "MSG1", "STR0"))
+    # AINI/AIN2 uses different section names from System 4.  Keep the
+    # container-specific default here so the strict fallback can still reach
+    # VARI/MSGI when the normal whole-file dump fails.
+    is_xsys35 = xsys35.is_xsys35_file(path)
+    default_sections = ("VARI", "MSGI") if is_xsys35 else ("MSG0", "MSG1", "STR0")
+    preferred = tuple(section_names or default_sections)
     sections = load_section_map(tools, path, map_encodings or ("CP932", "CP936", "UTF-8"))
     available = {s.name: s for s in sections if s.name in TEXT_SECTION_KINDS}
     if section_name is not None:
@@ -262,10 +267,10 @@ def load_text_section_with_fallback(
     else:
         candidates = [name for name in preferred if name in available]
     if not candidates:
-        raise ValueError("该 AIN 没有可用于回退的文本区段（MSG0/MSG1/STR0）")
+        names = "/".join(default_sections)
+        raise ValueError(f"该 AIN 没有可用于回退的文本区段（{names}）")
 
     encodings = tuple(text_encodings or ("CP936", "CP932", "UTF-8"))
-    is_xsys35 = xsys35.is_xsys35_file(path)
     # The same map and decrypted image serve every decoding attempt. In
     # particular, a failed encoding must not spawn alice again for each try.
     decrypted = None if is_xsys35 else tools.decrypted_bytes(path)  # type: ignore[attr-defined]

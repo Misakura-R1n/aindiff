@@ -691,6 +691,34 @@ class GuiStateTests(unittest.TestCase):
         self.assertEqual(app.left_dump.entries[0].text, "same")
         self.assertFalse(app.left_dump.entries[0].dirty)
 
+    def test_switch_view_matches_message_tags_on_each_side(self):
+        from aindiff.ain_sections import SectionInfo
+
+        app = HeadlessApp()
+        app.section_maps = {
+            "left": [SectionInfo("MSG0", 0, 14)],
+            "right": [SectionInfo("MSG1", 0, 21)],
+        }
+        message = b"hello"
+        encoded = bytes((byte + i + 0x60) & 255 for i, byte in enumerate(message))
+        tables = {
+            "left.ain": b"MSG0" + struct.pack("<i", 1) + message + b"\0",
+            "right.ain": b"MSG1" + struct.pack("<iii", 1, 0, len(encoded)) + encoded,
+        }
+        app.tools.map_dump.side_effect = lambda path, enc: (
+            f"{tables[path][:4].decode()}: 00000000 -> {len(tables[path]):08x}"
+        )
+        app.tools.decrypted_bytes.side_effect = tables.__getitem__
+        with patch.object(app, "_set_active_view") as activate, patch(
+            "aindiff.gui.messagebox.showerror"
+        ) as error:
+            for selected in ("MSG0", "MSG1"):
+                app.switch_view(selected)
+                left, right, _ = activate.call_args.args
+                self.assertEqual((left.sections, right.sections), (["MSG0"], ["MSG1"]))
+                self.assertEqual(left.entries[0].text, right.entries[0].text)
+            error.assert_not_called()
+
     def test_failed_view_read_preserves_unsaved_edits(self):
         app = HeadlessApp()
         row = app.add_row("a")

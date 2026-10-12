@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -208,6 +209,63 @@ class AliceToolsTests(unittest.TestCase):
                 self.tools.edit_text(self.ain, 's[1] = "changed"\n', "CP936")
         self.assertEqual(self.ain.read_bytes(), b"ORIGINAL")
         self.assertEqual(list(self.ain.parent.glob(".aindiff-edit-*")), [])
+
+
+class DownloadTests(unittest.TestCase):
+    def test_valid_archive_installs_executable_and_keeps_zip(self):
+        from aindiff import ALICE_RELEASE_TAG
+        from aindiff.alice_tools import download_alice
+
+        name = "alice.exe" if os.name == "nt" else "alice"
+
+        def download(url, target, **kwargs):
+            with zipfile.ZipFile(target, "w") as archive:
+                archive.writestr(f"release/{name}", b"executable")
+                archive.writestr("release/COPYING.txt", b"license")
+                archive.writestr("../unexpected.txt", b"ignored")
+
+        with tempfile.TemporaryDirectory() as td, patch(
+            "aindiff.alice_tools._download", side_effect=download
+        ):
+            root = Path(td)
+            exe = download_alice(root)
+            self.assertEqual(exe.read_bytes(), b"executable")
+            self.assertEqual((exe.parent / "COPYING.txt").read_bytes(), b"license")
+            self.assertTrue((root / f"alice-tools-{ALICE_RELEASE_TAG}.zip").is_file())
+            self.assertEqual(len(list(root.iterdir())), 2)
+
+    def test_invalid_archives_preserve_cached_executable(self):
+        from aindiff import ALICE_RELEASE_TAG
+        from aindiff.alice_tools import download_alice
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cache = root / f"alice-tools-{ALICE_RELEASE_TAG}"
+            cache.mkdir()
+            exe = cache / ("alice.exe" if os.name == "nt" else "alice")
+            exe.write_bytes(b"previous executable")
+
+            def download(url, target, **kwargs):
+                if mode == "invalid":
+                    target.write_bytes(b"not a zip")
+                    return
+                with zipfile.ZipFile(target, "w") as archive:
+                    if mode == "missing":
+                        archive.writestr("COPYING.txt", "license")
+                    else:
+                        archive.writestr(exe.name, b"new executable")
+                if mode == "crc":
+                    data = target.read_bytes().replace(b"new executable", b"bad executable")
+                    target.write_bytes(data)
+
+            for mode in ("invalid", "missing", "crc"):
+                with self.subTest(mode=mode), patch(
+                    "aindiff.alice_tools._download", side_effect=download
+                ):
+                    with self.assertRaises(AliceError):
+                        download_alice(root)
+                    self.assertEqual(exe.read_bytes(), b"previous executable")
+                    self.assertEqual(list(root.iterdir()), [cache])
 
 
 if __name__ == "__main__":

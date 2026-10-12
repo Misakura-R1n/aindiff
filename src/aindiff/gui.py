@@ -632,13 +632,24 @@ class AinDiffApp(tk.Tk):
         tools = self.tools
         left_cached, right_cached = self.text_left_dump, self.text_right_dump
 
+        def section_for(side):
+            available = {section.name for section in self.section_maps[side]}
+            if view_name in available:
+                return view_name
+            aliases = ("MSG0", "MSG1", "MSGI") if view_name in (
+                "MSG0", "MSG1", "MSGI"
+            ) else ("STR0", "VARI")
+            return next((name for name in aliases if name in available), view_name)
+
+        left_section, right_section = section_for("left"), section_for("right")
+
         def read():
             if view_name == _TEXT_VIEW:
                 left_raw, right_raw = left_cached, right_cached or TextDump("", "")
             else:
-                left_raw = load_section_dump(tools, left_cached.path, view_name, left_cached.encoding)
+                left_raw = load_section_dump(tools, left_cached.path, left_section, left_cached.encoding)
                 right_raw = (
-                    load_section_dump(tools, right_cached.path, view_name, right_cached.encoding)
+                    load_section_dump(tools, right_cached.path, right_section, right_cached.encoding)
                     if right_cached is not None else TextDump("", "")
                 )
             return left_raw, right_raw, align_dumps(left_raw, right_raw)

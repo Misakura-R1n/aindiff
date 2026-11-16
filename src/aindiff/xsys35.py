@@ -16,13 +16,13 @@ decompiler/ain.c).
 from __future__ import annotations
 
 import os
-import shutil
 import struct
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Optional, Sequence, Tuple
 
-from .model import TextDump, TextEntry, escape_text, parse_edit_text
+from .file_state import FileRevision, commit_edit
+from .model import TextDump, TextEntry, encode_edit, escape_text, parse_edit_text
 
 __all__ = [
     "MAGIC_AINI",
@@ -38,6 +38,7 @@ __all__ = [
 MAGIC_AINI = b"AINI"
 MAGIC_AIN2 = b"AIN2"
 SECTION_KINDS = {"VARI": "s", "MSGI": "m"}
+TEXT_ENCODINGS = ("UTF-8", "CP932", "CP936")
 KNOWN_SECTIONS = ("HEL0", "FUNC", "VARI", "MSGI")
 _DECRYPT_TABLE = bytes(((b << 2) | (b >> 6)) & 0xFF for b in range(256))
 _ENCRYPT_TABLE = bytes(((b >> 2) | (b << 6)) & 0xFF for b in range(256))
@@ -118,6 +119,7 @@ def _section_end(payload: bytes, start: int, name: str) -> int:
 def parse_sections(payload: bytes) -> List[Tuple[str, int, int]]:
     """Return [(name, start, end)] for the decrypted payload (after 8-byte header)."""
     sections: List[Tuple[str, int, int]] = []
+    seen_text = set()
     pos = 0
     while pos + 4 <= len(payload):
         name_bytes = payload[pos : pos + 4]
@@ -127,9 +129,15 @@ def parse_sections(payload: bytes) -> List[Tuple[str, int, int]]:
             break
         if name not in KNOWN_SECTIONS:
             break
+        if name in SECTION_KINDS:
+            if name in seen_text:
+                raise ValueError(f"AINI 含有重复的文本区段：{name}")
+            seen_text.add(name)
         end = _section_end(payload, pos, name)
         sections.append((name, pos, end))
         pos = end
+    if not sections:
+        raise ValueError("AINI 中没有可识别的区段")
     return sections
 
 
@@ -145,14 +153,11 @@ def _read_strings(payload: bytes, start: int, name: str) -> List[bytes]:
 
 def _encode_string(text: str, encoding: str) -> bytes:
     try:
-        encoded = text.encode(encoding)
-    except UnicodeEncodeError as exc:
+        return encode_edit(text, encoding)
+    except (ValueError, LookupError) as exc:
         raise ValueError(
             f"文本无法用 {encoding} 编码写回 AINI：{text[:40]!r}（{exc}）"
         ) from exc
-    if b"\0" in encoded:
-        raise ValueError("AINI 文本编码结果不能包含 NUL 字节")
-    return encoded
 
 
 def _build_ain_section(header: bytes, raw_strings: List[bytes]) -> bytes:
@@ -180,45 +185,39 @@ def map_text(path: str) -> str:
     lines = []
     for name, start, end in parse_sections(payload):
         lines.append(f"{name}: {8 + start:08x} -> {8 + end:08x}")
-    if not lines:
-        raise ValueError("AINI 中没有可识别的区段")
     return "\n".join(lines) + "\n"
 
 
-def _text_dump_sections(path: str, encoding: str) -> TextDump:
-    data, payload = _load(path)
+def _decode_tables(path: str, tables: dict[str, list[bytes]], encoding: str) -> TextDump:
     dump = TextDump(path=str(path), encoding=encoding)
-    sections = parse_sections(payload)
-    for name, start, end in sections:
-        if name not in SECTION_KINDS:
-            continue
-        kind = SECTION_KINDS[name]
-        raw_strings = _read_strings(payload, start, name)
-        section_no = len(dump.sections)
+    for section_no, (name, raw_strings) in enumerate(tables.items()):
+        table = decode_text_table(path, name, raw_strings, encoding)
         dump.sections.append(name)
-        for index, raw in enumerate(raw_strings):
-            dump.entries.append(
-                TextEntry(
-                    kind=kind,
-                    index=index,
-                    occurrence=1,
-                    text=raw.decode(encoding),
-                    section=name,
-                    section_no=section_no,
-                    line_no=index + 1,
-                )
-            )
+        for entry in table.entries:
+            entry.section_no = section_no
+        dump.entries.extend(table.entries)
     return dump
 
 
-def text_dump(path: str, encoding: str) -> TextDump:
+def text_dump(
+    path: str, encoding: Optional[str] = None, *, candidates: Optional[Sequence[str]] = None
+) -> TextDump:
     """Build a TextDump from VARI + MSGI (function-context view unavailable)."""
-    return _text_dump_sections(path, encoding)
+    tables = raw_text_tables(path)
+    if encoding is not None:
+        return _decode_tables(path, tables, encoding)
+    last_error = None
+    for candidate in candidates if candidates is not None else TEXT_ENCODINGS:
+        try:
+            return _decode_tables(path, tables, candidate)
+        except (UnicodeError, LookupError) as exc:
+            last_error = exc
+    raise ValueError(f"无法识别 AINI 文本编码（{last_error}）") from last_error
 
 
 def dump_text_syntax(path: str, encoding: str) -> str:
     """Return an ``ain dump -t``-style text for the AINI container."""
-    dump = _text_dump_sections(path, encoding)
+    dump = text_dump(path, encoding)
     lines: List[str] = []
     for section_name in dump.sections:
         lines.append(f"; {section_name}")
@@ -231,13 +230,22 @@ def dump_text_syntax(path: str, encoding: str) -> str:
 
 
 def section_dump(path: str, section_name: str, encoding: str) -> TextDump:
-    data, payload = _load(path)
-    sections = parse_sections(payload)
-    section = next((s for s in sections if s[0] == section_name), None)
-    if section is None or section_name not in SECTION_KINDS:
+    tables = raw_text_tables(path)
+    if section_name not in tables:
         raise ValueError(f"AINI 中不存在可编辑区段 {section_name}")
-    name, start, _end = section
-    raw_strings = _read_strings(payload, start, name)
+    return decode_text_table(path, section_name, tables[section_name], encoding)
+
+
+def raw_text_tables(path: str) -> dict[str, list[bytes]]:
+    _, payload = _load(path)
+    return {
+        name: _read_strings(payload, start, name)
+        for name, start, _ in parse_sections(payload)
+        if name in SECTION_KINDS
+    }
+
+
+def decode_text_table(path: str, name: str, raw_strings: list[bytes], encoding: str) -> TextDump:
     entries = [
         TextEntry(
             kind=SECTION_KINDS[name],
@@ -253,25 +261,8 @@ def section_dump(path: str, section_name: str, encoding: str) -> TextDump:
     return TextDump(path=str(path), encoding=encoding, sections=[name], entries=entries)
 
 
-def detect_encoding(path: str, candidates: Tuple[str, ...] = ("UTF-8", "CP932", "CP936")) -> str:
-    data, payload = _load(path)
-    sections = parse_sections(payload)
-    for encoding in candidates:
-        ok = True
-        for name, start, _end in sections:
-            if name not in SECTION_KINDS:
-                continue
-            for raw in _read_strings(payload, start, name):
-                try:
-                    raw.decode(encoding)
-                except UnicodeDecodeError:
-                    ok = False
-                    break
-            if not ok:
-                break
-        if ok:
-            return encoding
-    raise ValueError("无法识别 AINI 文本编码")
+def detect_encoding(path: str, candidates: Sequence[str] = TEXT_ENCODINGS) -> str:
+    return text_dump(path, candidates=candidates).encoding
 
 
 def edit_file(
@@ -282,23 +273,39 @@ def edit_file(
     backup: bool = True,
     backup_suffix: str = ".bak",
 ) -> Tuple[Path, int, int]:
-    path = Path(path).resolve()
-    old_size = path.stat().st_size
+    source = FileRevision.capture(path)
+    written = write_file(source, edit_text, output_encoding, backup_suffix if backup else None)
+    return written.path, source.size, written.size
+
+
+def write_file(
+    source: FileRevision, edit_text: str, output_encoding: str, backup_suffix: str | None
+) -> FileRevision:
+    with tempfile.TemporaryDirectory(prefix=".aindiff-edit-", dir=source.path.parent) as td:
+        staging = Path(td)
+        snapshot = source.snapshot(staging)
+        edited = _edited_data(snapshot, edit_text, output_encoding)
+        if edited is None:
+            source.check()
+            return source
+        output = staging / "output.ain"
+        output.write_bytes(edited)
+        return commit_edit(source, snapshot, output, backup_suffix)
+
+
+def _edited_data(path: Path, edit_text: str, output_encoding: str) -> Optional[bytes]:
     data, payload = _load(str(path))
 
     # Apply assignment statements (last one wins, like alice-tools).
     assignments = parse_edit_text(edit_text)
 
     sections = parse_sections(payload)
-    if not sections:
-        raise ValueError("AINI 中没有可识别的区段")
-    counts: Dict[str, int] = {}
-    for name, start, _end in sections:
-        if name in SECTION_KINDS:
-            kind = SECTION_KINDS[name]
-            if kind in counts:
-                raise ValueError(f"AINI 含有重复的文本区段：{name}")
-            counts[kind] = _read_u32(payload, start + 8)
+    if not assignments:
+        return None
+    counts = {
+        SECTION_KINDS[name]: _read_u32(payload, start + 8)
+        for name, start, _ in sections if name in SECTION_KINDS
+    }
     for kind, index in assignments:
         if index >= counts.get(kind, 0):
             raise ValueError(f"AINI 中不存在文本 {kind}[{index}]")
@@ -318,12 +325,5 @@ def edit_file(
     # Future/unknown sections and trailing bytes must survive a text edit.
     out += payload[sections[-1][2] :]
 
-    new_data = data[:8] + _encrypt_payload(bytes(out))
-    with tempfile.TemporaryDirectory(prefix=".aindiff-edit-", dir=path.parent) as td:
-        tmp = Path(td) / "output.ain"
-        tmp.write_bytes(new_data)
-        if backup:
-            backup_path = path.with_name(path.name + backup_suffix)
-            shutil.copy2(path, backup_path)
-        os.replace(tmp, path)
-    return path, old_size, path.stat().st_size
+    edited = data[:8] + _encrypt_payload(bytes(out))
+    return edited if edited != data else None

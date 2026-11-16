@@ -15,8 +15,9 @@ class LoadingTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.left = str(Path(self.tmp.name) / "left.ain")
-        self.right = str(Path(self.tmp.name) / "right.ain")
+        directory = Path(self.tmp.name).resolve()
+        self.left = str(directory / "left.ain")
+        self.right = str(directory / "right.ain")
         for path in (self.left, self.right):
             Path(path).write_bytes(b"synthetic")
         self.tools = Mock()
@@ -69,3 +70,21 @@ class LoadingTests(unittest.TestCase):
         with patch("aindiff.loading.open_dump", side_effect=AliceError("mixed")):
             with self.assertRaisesRegex(AliceError, "缺少"):
                 load_pair(self.tools, self.left, self.right, None, None)
+
+    def test_fallback_uses_other_shared_group_when_first_choice_is_missing(self):
+        messages = b"MSG0" + struct.pack("<I", 1) + b"hello\0"
+        strings = b"STR0" + struct.pack("<I", 1) + b"shared\0"
+        self.tools.map_dump.side_effect = lambda path, enc: (
+            f"MSG0: 0 -> {len(messages):x}\n"
+            f"STR0: {len(messages):x} -> {len(messages + strings):x}"
+            if path == self.left else f"STR0: 0 -> {len(strings):x}"
+        )
+        self.tools.decrypted_bytes.side_effect = {
+            self.left: messages + strings, self.right: strings,
+        }.__getitem__
+        with patch("aindiff.loading.open_dump", side_effect=AliceError("mixed")):
+            left, right, rows, notes = load_pair(self.tools, self.left, self.right, None, None)
+        self.assertEqual(left.sections, ["STR0"])
+        self.assertEqual(right.sections, ["STR0"])
+        self.assertEqual(count_changed(rows), 0)
+        self.assertEqual(notes, ["STR0"])

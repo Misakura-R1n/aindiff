@@ -19,7 +19,7 @@ from .alice_tools import (
     download_alice,
 )
 from .model import AlignedRow, count_changed
-from .loading import load_pair as _load_pair, open_dump_with_fallback as _open_dump_with_fallback  # noqa: F401
+from .loading import load_pair as _load_pair, load_table_pair
 
 __all__ = ["build_parser", "main"]
 
@@ -35,6 +35,13 @@ def _add_alice_option(parser: argparse.ArgumentParser) -> None:
 def _add_encoding_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--left-encoding", help="左侧 AIN 文本编码（默认自动识别）")
     parser.add_argument("--right-encoding", help="右侧 AIN 文本编码（默认自动识别）")
+
+
+def _add_view_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--view", choices=("tables", "functions"), default="tables",
+        help="对照完整原始文本表 tables（默认）或函数引用 functions",
+    )
 
 
 def _nonnegative_int(value: str) -> int:
@@ -70,9 +77,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_alice_option(export)
     _add_encoding_options(export)
+    _add_view_option(export)
     export.add_argument("left", help="左侧 .ain 文件")
     export.add_argument("right", help="右侧 .ain 文件")
     export.add_argument("-o", "--output", required=True, help="输出 TSV 路径")
+    export.add_argument(
+        "--spreadsheet-safe", action="store_true",
+        help="为可能被电子表格解释为公式的文本添加文本前缀",
+    )
 
     check = sub.add_parser(
         "check",
@@ -81,6 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_alice_option(check)
     _add_encoding_options(check)
+    _add_view_option(check)
     check.add_argument("left", help="左侧 .ain 文件")
     check.add_argument("right", help="右侧 .ain 文件")
     check.add_argument("--max-diffs", type=_nonnegative_int, default=20, help="最多显示多少条差异（默认 20）")
@@ -112,12 +125,12 @@ def _run_export(args: argparse.Namespace) -> int:
     output = Path(args.output).expanduser().resolve()
     for source in (args.left, args.right):
         source_path = Path(source).expanduser().resolve()
-        if output == source_path or (output.exists() and output.samefile(source_path)):
+        if output == source_path or (
+            output.exists() and source_path.is_file() and output.samefile(source_path)
+        ):
             raise AliceError("输出 TSV 路径不能与输入 AIN 文件相同")
     tools = AliceTools(args.alice) if args.alice else AliceTools()
-    left_dump, right_dump, rows, notes = _load_pair(
-        tools, args.left, args.right, args.left_encoding, args.right_encoding
-    )
+    _, _, rows, notes = _read_comparison(tools, args)
     for note in notes:
         print(f"注意：混合编码文件已回退到原始区段 {note}。")
 
@@ -126,16 +139,21 @@ def _run_export(args: argparse.Namespace) -> int:
     # existing result instead of leaving it truncated.
     with tempfile.TemporaryDirectory(prefix=".aindiff-export-", dir=output.parent) as tmp:
         staged = Path(tmp) / "output.tsv"
-        _write_tsv(staged, rows)
+        _write_tsv(staged, rows, spreadsheet_safe=args.spreadsheet_safe)
         os.replace(staged, output)
     print(f"已导出 {len(rows)} 行（含节标题）到 {output}")
     print(f"差异条目：{count_changed(rows)}")
     return 0
 
 
-def _write_tsv(output: Path, rows: list[AlignedRow]) -> None:
+def _write_tsv(output: Path, rows: list[AlignedRow], *, spreadsheet_safe: bool = False) -> None:
+    def cell(text: str) -> str:
+        if spreadsheet_safe and text.lstrip().startswith(("=", "+", "-", "@", "＝", "＋", "－", "＠")):
+            return "'" + text
+        return text
+
     with output.open("w", encoding="utf-8-sig", newline="") as fh:
-        writer = csv.writer(fh, delimiter="\t", lineterminator="\n")
+        writer = csv.writer(fh, delimiter="\t", lineterminator="\r\n")
         writer.writerow(
             ["no", "section_left", "section_right", "type", "id", "occurrence",
              "left", "right", "state"]
@@ -143,7 +161,7 @@ def _write_tsv(output: Path, rows: list[AlignedRow]) -> None:
         for row in rows:
             if row.is_section:
                 writer.writerow(
-                    ["", row.left_section or "", row.right_section or "",
+                    ["", cell(row.left_section or ""), cell(row.right_section or ""),
                      "SECTION", "", "", "", "", ""]
                 )
                 continue
@@ -158,23 +176,28 @@ def _write_tsv(output: Path, rows: list[AlignedRow]) -> None:
             writer.writerow(
                 [
                     row.no,
-                    (left_entry.section if left_entry else "") or "",
-                    (right_entry.section if right_entry else "") or "",
+                    cell(left_entry.section if left_entry else ""),
+                    cell(right_entry.section if right_entry else ""),
                     (left_entry or right_entry).kind,
                     (left_entry or right_entry).index,
                     (left_entry or right_entry).occurrence,
-                    left_entry.text if left_entry else "",
-                    right_entry.text if right_entry else "",
+                    cell(left_entry.text if left_entry else ""),
+                    cell(right_entry.text if right_entry else ""),
                     state,
                 ]
             )
 
 
-def _run_check(args: argparse.Namespace) -> int:
-    tools = AliceTools(args.alice) if args.alice else AliceTools()
-    left_dump, right_dump, rows, notes = _load_pair(
+def _read_comparison(tools: AliceTools, args: argparse.Namespace):
+    load = _load_pair if args.view == "functions" else load_table_pair
+    return load(
         tools, args.left, args.right, args.left_encoding, args.right_encoding
     )
+
+
+def _run_check(args: argparse.Namespace) -> int:
+    tools = AliceTools(args.alice) if args.alice else AliceTools()
+    left_dump, right_dump, rows, notes = _read_comparison(tools, args)
     for note in notes:
         print(f"注意：混合编码文件已回退到原始区段 {note}。")
     changed = [row for row in rows if not row.is_section and row.changed]
@@ -207,6 +230,12 @@ def _run_fetch(args: argparse.Namespace) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            if stream.isatty():
+                stream.reconfigure(errors="backslashreplace")
+            else:
+                stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     parser = build_parser()
 
     # Accept `aindiff left.ain right.ain` as shorthand for `aindiff gui ...`.

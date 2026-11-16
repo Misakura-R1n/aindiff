@@ -8,6 +8,7 @@ import csv
 import io
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -19,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from aindiff import cli  # noqa: E402
+from aindiff import xsys35
 from aindiff.model import count_changed, parse_dump
 
 # MSG0 occupies 0x30..0x3e (14 bytes): tag(4) + count(4) + "hi\0"(3) + "yo\0"(3).
@@ -89,10 +91,10 @@ class CliTests(unittest.TestCase):
         self.mixed = tmp / "mixed.ain"
         self.mixed.write_bytes(b"ORIGINAL")
 
-    def _run(self, argv):
+    def _run(self, argv, *, view="functions"):
         buf = io.StringIO()
         with redirect_stdout(buf), redirect_stderr(buf):
-            code = cli.main([argv[0], "--alice", str(self.alice), *argv[1:]])
+            code = cli.main([argv[0], "--alice", str(self.alice), "--view", view, *argv[1:]])
         return code, buf.getvalue()
 
     def test_check_same_file_reports_no_differences(self):
@@ -240,6 +242,51 @@ class CliTests(unittest.TestCase):
         code, out = self._run(["check", str(self.normal), str(self.normal), "--left-encoding", "UTF-8"])
         self.assertEqual(code, 1)
         self.assertIn("不完整", out)
+
+    def test_header_only_aini_is_rejected_in_both_views(self):
+        self.normal.write_bytes(b"AINI" + struct.pack("<I", 1))
+        for view in ("tables", "functions"):
+            with self.subTest(view=view):
+                code, out = self._run(["check", str(self.normal), str(self.normal)], view=view)
+                self.assertEqual(code, 1)
+                self.assertIn("没有可识别的区段", out)
+
+    def test_default_cli_compares_raw_entries_and_exports_safe_tsv(self):
+        def aini(message):
+            payload = b"MSGI" + struct.pack("<II", 0, 1) + message.encode("utf-8") + b"\0"
+            return b"AINI" + struct.pack("<I", 1) + xsys35._encrypt_payload(payload)
+
+        self.normal.write_bytes(aini("plain\rtext"))
+        self.mixed.write_bytes(aini("=text"))
+        argv = ["--alice", str(self.alice), str(self.normal), str(self.mixed)]
+        output = self.normal.with_suffix(".tsv")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(cli.main(["check", *argv]), 0)
+            self.assertEqual(cli.main(["export", *argv, "-o", str(output), "--spreadsheet-safe"]), 0)
+        self.assertIn("差异：1", buf.getvalue())
+        with output.open(encoding="utf-8-sig", newline="") as fh:
+            row = list(csv.DictReader(fh, delimiter="\t"))[1]
+        self.assertEqual((row["left"], row["right"]), ("plain\rtext", "'=text"))
+
+    def test_help_works_with_non_utf8_stdout(self):
+        env = dict(os.environ, PYTHONIOENCODING="cp1252", PYTHONPATH=str(ROOT / "src"))
+        result = subprocess.run(
+            [sys.executable, "-B", "-m", "aindiff", "--help"],
+            capture_output=True, env=env, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b"usage:", result.stdout)
+        self.assertIn("双栏文本编辑", result.stdout.decode("utf-8"))
+
+    def test_cli_reads_aini_without_looking_for_alice(self):
+        payload = b"MSGI" + struct.pack("<II", 0, 1) + b"message\0"
+        self.normal.write_bytes(b"AINI" + struct.pack("<I", 1) + xsys35._encrypt_payload(payload))
+        with (
+            patch("aindiff.alice_tools.find_alice", side_effect=AssertionError("AINI needs no alice")),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(cli.main(["check", str(self.normal), str(self.normal)]), 0)
 
 
 if __name__ == "__main__":

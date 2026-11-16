@@ -17,6 +17,7 @@ python -m unittest discover -s tests -v
 | `aindiff.model` | 解析/生成 `ain dump -t` 文本格式；转义；双栏对齐 |
 | `aindiff.alice_tools` | 查找/下载/调用 alice；编码探测；解密镜像；原子写回 |
 | `aindiff.ain_sections` | 解析 `ain dump --map`，读取 MSG0/MSG1/STR0 文本区段 |
+| `aindiff.file_state` | 文件版本检查、备份恢复和产物更新 |
 | `aindiff.gui` | Tkinter 窗口、Treeview 渲染、查找定位、结构导航、就地编辑、保存流程 |
 | `aindiff.cli` | 子命令 `gui` / `export` / `check` / `fetch-alice` |
 | `aindiff.loading` | GUI/CLI 共用的文件读取、编码回退和对应文本表选择 |
@@ -24,7 +25,7 @@ python -m unittest discover -s tests -v
 分层原则：
 
 - `model` 不接触子进程和文件系统之外的 .ain 细节，便于纯单元测试。
-- `gui` 只通过 `alice_tools.AliceTools` 读写 .ain。
+- `gui` 使用加载模块取得视图，通过 `AliceTools` 提交写回。内置 AINI/AIN2 支持无需启动 alice。
 - 所有 alice 参数拼接集中在 `alice_tools.py`，升级 alice-tools 时只改一处。
 
 ## 测试约定
@@ -36,6 +37,7 @@ python -m unittest discover -s tests -v
 - `tests/test_gui_helpers.py`：不创建 Tk 窗口，覆盖筛选、查找、编辑、保存及视图切换状态。
 - `tests/test_ain_sections.py` / `tests/test_xsys35.py`：使用合成容器检查区段解析、严格解码及旧容器写回。
 - `tests/test_cli.py`：验证命令行、回退对照及导出失败时保留原结果。
+- `tests/test_integration.py` 使用少量合成样本覆盖真实 Tk、随附 alice 和解压后的 Windows 发布包。CI 在 Linux 的 Xvfb 会话及 Windows 运行 Tk 验证。
 
 GUI 自测限少量合成文本，禁止全量 GUI 压测；真实文件写回只操作临时副本。查找可用按钮或 Enter／Shift+Enter，避免与其他软件的 F3 冲突。
 
@@ -62,11 +64,11 @@ PY
 
 混合编码写回的原理与上游代码依据见 [alice-tools 结合点](alice-tools-integration.md)。
 
-GUI 后台任务只读取快照参数并生成模型，不调用 Tk；主线程轮询取回结果，失败保留原模型。主表按 300 行分批插入，忙碌期间禁用相关操作；关闭窗口会忽略未完成结果。
+GUI 在后台执行读取、对齐和写回，主线程轮询结果。主表按 300 行分批插入。退出时关闭活动的读取子进程。写回期间允许窗口重绘，写回结束后可关闭窗口。
 编辑时按已应用的筛选条件更新单行及所属节的可见计数；重新输入查询并应用筛选时才全表重建。主表仍保留全部行，未实现虚拟列表。
 超过一万行的显式搜索/筛选由 `_scan_rows` 在 Tk 主线程分批处理，每批最多 5000 行、约 8 ms 后让出事件循环。扫描过程中保持旧表格和筛选索引，完成时统一替换；关闭窗口取消回调。同查询筛选可复用完整搜索命中集合。
-编辑提交中必要的重筛、保存后的刷新仍同步执行，避免内部扫描使“全部保存”的第二侧被忙碌状态拦截；这些路径不承诺分批响应。
-`model.parse_edit_text` 是 AINI 与混合编码写回共用的严格补丁解析器；读取 dump 的注释语义不同，保留独立的 `parse_dump`。
+“全部保存”在上一侧写回和界面刷新结束后继续下一侧。写回完成后同步更新视图，区段表从已写入的版本读取。
+`model.parse_edit_text` 严格解析两种格式的数字 ID 补丁。`parse_dump` 保留读取文本转储时需要的注释语义。
 
 ## 应用图标
 

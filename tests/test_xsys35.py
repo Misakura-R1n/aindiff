@@ -1,3 +1,5 @@
+import os
+import stat
 import struct
 import sys
 import tempfile
@@ -9,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from aindiff import xsys35  # noqa: E402
+from aindiff.file_state import FileRevision
 from aindiff.model import parse_dump  # noqa: E402
 
 
@@ -114,9 +117,12 @@ class Xsys35Tests(unittest.TestCase):
 
     def test_dump_with_only_comments_does_not_reencode_text(self):
         original = self.path.read_bytes()
+        backup = self.path.with_suffix(".ain.bak")
+        backup.write_bytes(b"previous backup")
         edit = xsys35.dump_text_syntax(str(self.path), "CP932")
-        xsys35.edit_file(self.path, edit, "CP932", backup=False)
+        xsys35.edit_file(self.path, edit, "CP932")
         self.assertEqual(self.path.read_bytes(), original)
+        self.assertEqual(backup.read_bytes(), b"previous backup")
 
     def test_edit_supports_escaped_text_and_unicode_line_separator(self):
         edit = 'm[1] = "a\\\"b\\\\c\\n\\r\\t\u2028z"'
@@ -189,6 +195,51 @@ class Xsys35Tests(unittest.TestCase):
                 xsys35.edit_file(self.path, 'm[1] = "test"', "UTF-8", backup=False)
         self.assertEqual(self.path.read_bytes(), original)
         self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+
+    def test_failed_replace_preserves_existing_backup(self):
+        backup = self.path.with_suffix(".ain.bak")
+        backup.write_bytes(b"previous backup")
+        replace = os.replace
+
+        def replace_locked_file(source, target):
+            if Path(target) == self.path.resolve():
+                raise PermissionError("file locked")
+            replace(source, target)
+
+        with mock.patch("aindiff.file_state.os.replace", side_effect=replace_locked_file):
+            with self.assertRaisesRegex(PermissionError, "file locked"):
+                xsys35.edit_file(self.path, 'm[1] = "changed"', "UTF-8")
+        self.assertEqual(self.path.read_bytes(), make_ain())
+        self.assertEqual(backup.read_bytes(), b"previous backup")
+        self.assertEqual(set(self.path.parent.iterdir()), {self.path, backup})
+
+    def test_backup_does_not_modify_hard_link_target(self):
+        other = self.path.with_name("other")
+        other.write_bytes(b"unchanged")
+        backup = self.path.with_suffix(".ain.bak")
+        try:
+            os.link(other, backup)
+        except OSError as exc:
+            self.skipTest(f"hard links unavailable: {exc}")
+        xsys35.edit_file(self.path, 'm[1] = "changed"', "UTF-8")
+        self.assertEqual(other.read_bytes(), b"unchanged")
+        self.assertEqual(backup.read_bytes(), make_ain())
+
+    def test_loaded_revision_rejects_later_changes_before_commit(self):
+        revision = FileRevision.capture(self.path)
+        externally_changed = _container(_section("MSGI", ["new", "external"]))
+        self.path.write_bytes(externally_changed)
+        with self.assertRaisesRegex(OSError, "已被替换或修改"):
+            xsys35.write_file(revision, 'm[1] = "changed"', "UTF-8", ".bak")
+        self.assertEqual(self.path.read_bytes(), externally_changed)
+        self.assertFalse(self.path.with_suffix(".ain.bak").exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX file modes")
+    def test_edit_preserves_posix_mode(self):
+        self.path.chmod(0o600)
+        xsys35.edit_file(self.path, 'm[1] = "changed"', "UTF-8")
+        for path in (self.path, self.path.with_suffix(".ain.bak")):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
 
 if __name__ == "__main__":

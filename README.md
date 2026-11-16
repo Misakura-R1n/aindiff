@@ -24,15 +24,17 @@ System4 的读取和写回调用 [alice-tools](https://github.com/nunuhara/alice
 - **查找与筛选**：按两侧文本、节名、类型或 ID 查找；支持“仅显示匹配”和“仅显示差异行”。
 - **大表响应**：首次查找和筛选分批计算，显示进度并保持窗口响应；同查询筛选复用查找结果。
 - **文本区段导航**：System4 支持 MSG0/MSG1 消息表、STR0 字符串表；xsys35 支持 MSGI/VARI。其他区段只显示信息。
-- **编辑与备份**：支持多行文本；默认写回前备份为 `<原文件名>.bak`，生成临时文件后原子替换原文件。
+- **编辑与备份**支持多行文本和后台写回。默认在原文件旁保留 `<原文件名>.bak`，并在替换前检查文件是否已变动。
 - **混合编码回退**：函数级文本无法读取时尝试原始文本表。回退视图只包含选中的表，并非整个 AIN 的全部文本。
-- **命令行**：通过 `check` 查看差异统计，通过 `export` 导出 UTF-8 TSV 对照表。
+- **命令行**默认按原始文本表和 ID 对照，包含未被函数引用的条目。`check` 查看差异，`export` 导出 UTF-8 TSV。
 
 ## 编辑与保存
 
 1. 双击左侧或右侧文本单元格；回车换行，`Ctrl+Enter` 或点击别处提交，`Esc` 取消。
 2. 点“保存左侧 / 保存右侧”，或按 `Ctrl+S` 保存有修改的两侧；写回前会询问确认。
-3. 默认备份在原文件旁，例如 `game.ain.bak`。**后续保存会覆盖同名备份**；需要保留最初版本时，请另行复制。
+3. 默认备份在原文件旁，例如 `game.ain.bak`。**后续成功保存会更新同名备份**。需要保留最初版本时，请另行复制。
+
+左右打开同一文件时，请只保留一侧进入编辑。如果原文件在加载后有外部变动，先保留当前修改内容，再重新加载对应版本。
 
 同一 `s[id]` 或 `m[id]` 可能在多个位置出现，但文件中对应同一个表项。
 修改一处并保存后，其他出现位置会同步更新；若多处编辑互相冲突，工具会拒绝保存。
@@ -69,11 +71,11 @@ python -m pip install -e .
 python -m aindiff fetch-alice
 ```
 
-`fetch-alice` 下载项目指定的 Windows 发布包，默认存入用户缓存，运行时自动查找。
+`fetch-alice` 下载项目指定的 Windows 发布包，核对可执行文件的 SHA-256 后写入用户缓存，运行时自动查找。
 也可从 [alice-tools Releases](https://github.com/nunuhara/alice-tools/releases) 获取工具，
 将 `alice.exe` 放到 `vendor/alice/alice.exe`，或用 `AINDIF_ALICE` 环境变量、`--alice PATH` 指定。
 Linux 等平台应自行安装对应平台的 alice，并确保 Tkinter 可用。
-当前应用初始化时仍会查找 alice，源码运行旧 xsys35 文件也需完成这一步。
+只有读取或写回 System4 时才查找 alice。旧 xsys35 文件可使用内置解析器独立处理。
 
 ```bash
 # 空窗口、单文件、双文件
@@ -87,6 +89,7 @@ python -m aindiff gui "原版.ain" "汉化.ain" --left-encoding CP932 --right-en
 # 差异统计与 TSV 导出
 python -m aindiff check "原版.ain" "汉化.ain" --max-diffs 20
 python -m aindiff export "原版.ain" "汉化.ain" -o "compare.tsv"
+python -m aindiff export "原版.ain" "汉化.ain" --spreadsheet-safe -o "excel.tsv"
 
 # 显式指定 alice；选项放在子命令后
 python -m aindiff check --alice "vendor/alice/alice.exe" "A.ain" "B.ain"
@@ -99,7 +102,7 @@ python -m aindiff export --help
 不安装本项目时，可用 `python scripts/run_gui.py "A.ain" "B.ain"`；
 Windows 也可使用 `scripts\run_gui.bat "A.ain" "B.ain"`。
 
-CLI 未指定编码时可自动回退，对照时会统一使用对应的原始表，并提示实际区段。
+使用 `--view functions` 可以按函数引用对照。未指定编码时，该视图可以回退到两侧共同可解码的原始区段。
 CLI 显式指定编码后，读取失败直接报错。TSV 输出不能指向输入 AIN；已有 TSV 会在成功导出后被替换。
 
 ## 开发与文档

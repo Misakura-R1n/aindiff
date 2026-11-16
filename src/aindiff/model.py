@@ -175,6 +175,16 @@ def escape_text(text: str) -> str:
     )
 
 
+def encode_edit(text: str, encoding: str) -> bytes:
+    """Encode a replacement that will read back exactly as entered."""
+    encoded = text.encode(encoding)
+    if b"\0" in encoded:
+        raise ValueError("写回文本的编码结果不能包含 NUL 字节")
+    if encoded.decode(encoding) != text:
+        raise ValueError(f"文本无法用 {encoding} 无损往返编码")
+    return encoded
+
+
 def normalize_search_text(text: str) -> str:
     """Normalize text for searching.
 

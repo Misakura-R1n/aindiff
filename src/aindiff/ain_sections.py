@@ -19,8 +19,10 @@ import struct
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
+from .file_state import FileRevision
 from .model import TextDump, TextEntry
 from . import xsys35
+from .alice_tools import AliceError, AliceRunError
 
 __all__ = [
     "SectionInfo",
@@ -35,6 +37,8 @@ __all__ = [
 
 # Sections whose payload is a string table usable for side-by-side editing.
 TEXT_SECTION_KINDS = {"MSG0": "m", "MSG1": "m", "STR0": "s", "VARI": "s", "MSGI": "m"}
+TEXT_SECTION_GROUPS = (("MSG0", "MSG1", "MSGI"), ("STR0", "VARI"))
+SYSTEM4_ENCODINGS = ("CP932", "CP936", "UTF-8", "BIG5")
 
 _MAP_RE = re.compile(r"^\s*([A-Z0-9]+):\s*([0-9a-fA-F]+)\s*->\s*([0-9a-fA-F]+)\s*$")
 _MAX_ENTRIES = 10_000_000
@@ -68,6 +72,13 @@ def parse_section_map(text: str) -> List[SectionInfo]:
         sections.append(SectionInfo(name, int(start_s, 16), int(end_s, 16)))
     if not sections:
         raise ValueError("无法从 alice ain dump --map 的输出中解析到任何区段")
+    previous_end = 0
+    seen = set()
+    for section in sorted(sections, key=lambda item: item.start):
+        if section.name in seen or section.size <= 0 or section.start < previous_end:
+            raise ValueError(f"AIN 区段重复或范围异常：{section.describe()}")
+        seen.add(section.name)
+        previous_end = section.end
     return sections
 
 
@@ -142,6 +153,8 @@ def build_section_dump(
     kind = TEXT_SECTION_KINDS.get(section_name)
     if kind is None:
         raise ValueError(f"区段 {section_name} 不是可编辑的文本区段")
+    if data[:4] != section_name.encode("ascii"):
+        raise ValueError(f"区段标签和映射不一致：期望 {section_name}，实际 {data[:4]!r}")
 
     if section_name == "MSG1":
         texts = _decode_msg1_table(data, encoding, errors)
@@ -163,6 +176,20 @@ def build_section_dump(
     return TextDump(path=str(path), encoding=encoding, sections=[section_name], entries=entries)
 
 
+def read_system4_sections(
+    tools: object,
+    path: str,
+    sections: Sequence[SectionInfo],
+    encoding: str,
+) -> list[TextDump]:
+    """Read the specified System4 tables from one decrypted image."""
+    decrypted = tools.decrypted_bytes(path)  # type: ignore[attr-defined]
+    return [
+        build_section_dump(path, section.name, encoding, _slice_section(decrypted, section))
+        for section in sections
+    ]
+
+
 def load_section_map(
     tools: object, path: str, encodings: Sequence[str]
 ) -> List[SectionInfo]:
@@ -171,9 +198,13 @@ def load_section_map(
         try:
             map_text = tools.map_dump(path, encoding)  # type: ignore[attr-defined]
             return parse_section_map(map_text)
-        except Exception as exc:  # noqa: BLE001 - any failure means "try next"
+        except AliceError as exc:
+            if not isinstance(exc, AliceRunError):
+                raise
             last_error = exc
-    raise ValueError(f"无法读取 AIN 区段表：{path}") from last_error
+        except (OSError, RuntimeError, ValueError) as exc:
+            last_error = exc
+    raise ValueError(f"无法读取 AIN 区段表：{path}（{last_error}）") from last_error
 
 
 def load_section_dump(
@@ -191,10 +222,14 @@ def load_section_dump(
     :mod:`aindiff.alice_tools`.
     """
 
+    revision = FileRevision.capture(path)
+    path = str(revision.path)
     if xsys35.is_xsys35_file(path):
         if section_name not in xsys35.SECTION_KINDS:
             raise ValueError(f"AINI 区段 {section_name} 不可编辑（支持 VARI/MSGI）")
-        return xsys35.section_dump(path, section_name, encoding)
+        dump = xsys35.section_dump(path, section_name, encoding)
+        revision.check()
+        return dump
 
     if section_name not in TEXT_SECTION_KINDS:
         raise ValueError(f"区段 {section_name} 不是可编辑的文本区段（支持 MSG0/MSG1/STR0）")
@@ -206,9 +241,9 @@ def load_section_dump(
     section = next((s for s in sections if s.name == section_name), None)
     if section is None:
         raise ValueError(f"该 AIN 中不存在区段 {section_name}")
-    decrypted = tools.decrypted_bytes(path)  # type: ignore[attr-defined]
-    data = _slice_section(decrypted, section)
-    return build_section_dump(path, section_name, encoding, data)
+    dump = read_system4_sections(tools, path, (section,), encoding)[0]
+    revision.check()
+    return dump
 
 
 def text_section_names(
@@ -252,43 +287,56 @@ def load_text_section_with_fallback(
     :attr:`TextDump.sections` so callers can show which view they got.
     """
 
-    # AINI/AIN2 uses different section names from System 4.  Keep the
-    # container-specific default here so the strict fallback can still reach
-    # VARI/MSGI when the normal whole-file dump fails.
-    is_xsys35 = xsys35.is_xsys35_file(path)
-    default_sections = ("VARI", "MSGI") if is_xsys35 else ("MSG0", "MSG1", "STR0")
-    preferred = tuple(section_names or default_sections)
-    sections = load_section_map(tools, path, map_encodings or ("CP932", "CP936", "UTF-8"))
-    available = {s.name: s for s in sections if s.name in TEXT_SECTION_KINDS}
+    reader = TextTableReader(tools, path, map_encodings=map_encodings)
+    preferred = tuple(section_names or reader.names)
     if section_name is not None:
-        if section_name not in available:
+        if section_name not in reader.names:
             raise ValueError(f"该 AIN 中不存在可回退的文本区段 {section_name}")
-        candidates = [section_name]
-    else:
-        candidates = [name for name in preferred if name in available]
+        preferred = (section_name,)
+    candidates = [name for name in preferred if name in reader.names]
     if not candidates:
-        names = "/".join(default_sections)
-        raise ValueError(f"该 AIN 没有可用于回退的文本区段（{names}）")
-
-    encodings = tuple(text_encodings or ("CP936", "CP932", "UTF-8"))
-    # The same map and decrypted image serve every decoding attempt. In
-    # particular, a failed encoding must not spawn alice again for each try.
-    decrypted = None if is_xsys35 else tools.decrypted_bytes(path)  # type: ignore[attr-defined]
-    last_error: Optional[Exception] = None
+        raise ValueError("该 AIN 没有可用于回退的文本区段")
+    encodings = text_encodings or reader.fallback_encodings
+    last_error = None
     for name in candidates:
         try:
-            data = _slice_section(decrypted, available[name]) if decrypted is not None else None
-        except ValueError as exc:
+            return reader.read(name, encodings)
+        except (ValueError, LookupError) as exc:
             last_error = exc
-            continue
-        for encoding in encodings:
+    raise ValueError(f"自动识别和区段回退均失败（{last_error}）") from last_error
+
+
+class TextTableReader:
+    """A stable image and map, shared by the requested raw-table decodes."""
+
+    def __init__(self, tools: object, path: str, *, map_encodings: Optional[Sequence[str]] = None):
+        revision = FileRevision.capture(path)
+        self.path = path = str(revision.path)
+        self._legacy = xsys35.is_xsys35_file(path)
+        if self._legacy:
+            self._legacy_tables = xsys35.raw_text_tables(path)
+            self.names = tuple(name for name in ("VARI", "MSGI") if name in self._legacy_tables)
+            self.encodings = xsys35.TEXT_ENCODINGS
+            self.fallback_encodings = xsys35.TEXT_ENCODINGS
+        else:
+            sections = load_section_map(tools, path, map_encodings or SYSTEM4_ENCODINGS)
+            self._sections = {section.name: section for section in sections}
+            self.names = tuple(name for name in ("MSG0", "MSG1", "STR0") if name in self._sections)
+            self._image = tools.decrypted_bytes(path) if self.names else b""  # type: ignore[attr-defined]
+            self.encodings = SYSTEM4_ENCODINGS
+            self.fallback_encodings = ("CP936", "CP932", "UTF-8", "BIG5")
+        revision.check()
+
+    def read(self, name: str, encodings: Sequence[str]) -> TextDump:
+        if name not in self.names:
+            raise ValueError(f"该 AIN 中不存在区段 {name}：{self.path}")
+        data = None if self._legacy else _slice_section(self._image, self._sections[name])
+        last_error = None
+        for encoding in dict.fromkeys(encodings):
             try:
-                if is_xsys35:
-                    return load_section_dump(tools, path, name, encoding)
-                # Replacement decoding would always accept the first candidate,
-                # turning invalid bytes into U+FFFD instead of trying the next.
-                return build_section_dump(path, name, encoding, data, errors="strict")
-            except (OSError, ValueError) as exc:
+                if data is None:
+                    return xsys35.decode_text_table(self.path, name, self._legacy_tables[name], encoding)
+                return build_section_dump(self.path, name, encoding, data)
+            except (UnicodeError, LookupError) as exc:
                 last_error = exc
-                continue
-    raise ValueError("自动识别和区段回退均失败，该 AIN 暂不受支持。") from last_error
+        raise ValueError(f"{self.path} 的区段 {name} 无法用指定编码解码（{last_error}）") from last_error

@@ -17,6 +17,8 @@ import hashlib
 import shutil
 import subprocess
 import sys
+import sysconfig
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -25,6 +27,7 @@ SRC = ROOT / "src"
 sys.path.insert(0, str(SRC))
 
 from aindiff import __version__  # noqa: E402
+from aindiff.file_state import publish_files
 
 
 def run(cmd: list[str]) -> None:
@@ -33,6 +36,9 @@ def run(cmd: list[str]) -> None:
 
 
 def main() -> int:
+    if sys.platform != "win32" or sysconfig.get_platform() != "win-amd64":
+        print("win64 发布包需要 64 位 x86 Windows Python。", file=sys.stderr)
+        return 1
     alice = ROOT / "vendor" / "alice" / "alice.exe"
     if not alice.is_file():
         print(
@@ -71,20 +77,26 @@ def main() -> int:
     release_dir = ROOT / "release"
     release_dir.mkdir(exist_ok=True)
     zip_path = release_dir / f"aindiff-v{__version__}-win64.zip"
-    if zip_path.exists():
-        zip_path.unlink()
-    base = f"aindiff-v{__version__}-win64"
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        for file in sorted(dist.rglob("*")):
-            if file.is_file():
-                zf.write(file, Path(base) / file.relative_to(dist))
-
-    digest = hashlib.sha256()
-    with zip_path.open("rb") as archive:
-        for chunk in iter(lambda: archive.read(1024 * 1024), b""):
-            digest.update(chunk)
     checksum_path = zip_path.with_suffix(".zip.sha256")
-    checksum_path.write_text(f"{digest.hexdigest()}  {zip_path.name}\n", encoding="ascii")
+    with tempfile.TemporaryDirectory(prefix=".aindiff-release-", dir=release_dir) as temp:
+        staged_zip = Path(temp) / zip_path.name
+        staged_checksum = Path(temp) / checksum_path.name
+        with zipfile.ZipFile(
+            staged_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
+        ) as zf:
+            for file in sorted(dist.rglob("*")):
+                if file.is_file():
+                    zf.write(file, Path(zip_path.stem) / file.relative_to(dist))
+        with zipfile.ZipFile(staged_zip) as zf:
+            broken = zf.testzip()
+            if broken is not None:
+                raise ValueError(f"发布包内文件校验失败：{broken}")
+        digest = hashlib.sha256()
+        with staged_zip.open("rb") as archive:
+            for chunk in iter(lambda: archive.read(1024 * 1024), b""):
+                digest.update(chunk)
+        staged_checksum.write_text(f"{digest.hexdigest()}  {zip_path.name}\n", encoding="ascii")
+        publish_files(release_dir, [(staged_zip, zip_path), (staged_checksum, checksum_path)])
     print(f"release: {zip_path} ({zip_path.stat().st_size} bytes)")
     print(f"checksum: {checksum_path}")
     return 0

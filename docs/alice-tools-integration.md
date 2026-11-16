@@ -48,17 +48,17 @@ alice 0.13.0 的 [ain_edit.c](https://github.com/nunuhara/alice-tools/blob/0.13.
 1. 严格解析本程序生成的数字 ID 赋值，反转义后按实际目标编码生成字节。
 2. 将这些字节一一映射到 Latin-1 字符，重新转义并以 UTF-8 保存临时补丁。必须在字节映射后转义，避免 CP932/CP936 的反斜杠尾字节被当作语法。
 3. 使用 `--input-encoding UTF-8 --output-encoding ISO-8859-1` 交给 alice，得到原本所需的目标字节。Latin-1 仅用于临时传输，不改变用户选择或文件的实际文本编码。
-4. 重试前移除第一次失败产生的临时输出；成功生成非空文件后才备份并原子替换。
+4. 重试前移除第一次失败产生的临时输出。生成文件的对应区段必须包含预期文本字节，校验通过后才提交写回及备份。
 
 函数名初始化能通过 Latin-1 解码，存储内容无需转码。实现仍使用上游写入器，未新增 System4 二进制写入器。
 参见上游 [text_lexer.l](https://github.com/nunuhara/alice-tools/blob/0.13.0/src/core/ain/text_lexer.l) 中的转义与 `conv_output` 处理。
-重试拒绝非法补丁、NUL、不可编码文本及超出上游固定字符串缓冲区的传输内容，不吞掉非编码错误。
+两条写回路径均检查补丁语法、编码往返、NUL 和上游词法缓冲区的文本长度。
 
 真实样本验证中，ランス０２同时修改 MSG0、STR0 后的完整解密数据与预期字节一致，恢复后也完全一致；这仍不等于游戏内运行验证。
 
 ## 升级上游
 
 1. 查看 [Releases](https://github.com/nunuhara/alice-tools/releases) 最新 tag。
-2. 更新 `src/aindiff/__init__.py` 中的 `ALICE_RELEASE_URL`/`ALICE_RELEASE_TAG`。
+2. 更新 `src/aindiff/__init__.py` 中的 `ALICE_RELEASE_URL`、`ALICE_RELEASE_TAG` 和对应可执行文件的 `ALICE_EXE_SHA256`。
 3. 更新 `vendor/alice/alice.exe` 或用户缓存。
 4. 跑 `python -m unittest` 与 `aindiff check <a.ain> <b.ain>` 冒烟测试。

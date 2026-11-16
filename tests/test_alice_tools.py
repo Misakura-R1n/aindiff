@@ -1,7 +1,10 @@
+import hashlib
 import json
 import os
+import struct
 import sys
 import tempfile
+import threading
 import unittest
 import zipfile
 from pathlib import Path
@@ -105,7 +108,9 @@ class AliceToolsTests(unittest.TestCase):
             output.write_bytes(b"SAVED")
 
         with patch.object(self.tools, "run", side_effect=run):
-            self.tools.edit_text(self.ain, f'm[0] = "{escape_text(text)}"\n', "CP936")
+            with patch.object(self.tools, "_verify_edited_text") as verify:
+                self.tools.edit_text(self.ain, f'm[0] = "{escape_text(text)}"\n', "CP936")
+        self.assertEqual(verify.call_args.args[1], {("m", 0): text.encode("CP936")})
         self.assertEqual(len(calls), 2)
         self.assertEqual(self.ain.read_bytes(), b"SAVED")
         self.assertEqual(self.ain.with_suffix(".ain.bak").read_bytes(), b"ORIGINAL")
@@ -152,26 +157,68 @@ class AliceToolsTests(unittest.TestCase):
         encoding = self.tools.detect_encoding(self.ain, candidates=("FAIL", "CP936"))
         self.assertEqual(encoding, "CP936")
 
+    def test_dump_text_auto_reuses_successful_dump(self):
+        with patch.object(self.tools, "dump_text", return_value="text") as dump:
+            self.assertEqual(self.tools.dump_text_auto(self.ain, ("CP932",)), ("text", "CP932"))
+        dump.assert_called_once_with(self.ain, "CP932")
+
+    def test_close_kills_active_child_and_prevents_new_commands(self):
+        runner = AliceTools(sys.executable)
+        # The Popen notification occurs under the same lock as child registration.
+        started = threading.Event()
+        errors = []
+
+        def worker():
+            try:
+                runner.run(["-c", "import time; time.sleep(10)"], timeout=3)
+            except AliceError as exc:
+                errors.append(exc)
+
+        import subprocess
+        popen = subprocess.Popen
+
+        def start(*args, **kwargs):
+            child = popen(*args, **kwargs)
+            started.set()
+            return child
+
+        with patch("aindiff.alice_tools.subprocess.Popen", side_effect=start):
+            task = threading.Thread(target=worker)
+            task.start()
+            try:
+                self.assertTrue(started.wait(2))
+                runner.close()
+                task.join(2)
+                self.assertFalse(task.is_alive())
+            finally:
+                task.join(4)
+        self.assertIsInstance(errors[0], AliceRunError)
+        with self.assertRaisesRegex(AliceError, "已取消"):
+            runner.run(["--version"])
+
     def test_dump_text_honors_output_encoding(self):
         text = self.tools.dump_text(self.ain, "CP936", output_encoding="CP936")
         self.assertIn("消息", text)
 
     def test_edit_text_writes_back_and_makes_backup(self):
-        old, before, after = self.tools.edit_text(
-            self.ain, 's[1] = "changed"\n', "CP936", backup=True
-        )
+        with patch.object(self.tools, "_verify_edited_text"):
+            old, before, after = self.tools.edit_text(
+                self.ain, 's[1] = "changed"\n', "CP936", backup=True
+            )
         self.assertEqual(old, self.ain.resolve())
         self.assertEqual(before, len(b"ORIGINAL"))
         self.assertNotEqual(after, before)
         self.assertTrue(self.ain.with_name("input.ain.bak").exists())
         args = json.loads(self.log.read_text(encoding="utf-8"))
         self.assertEqual(args[args.index("--output-encoding") + 1], "CP936")
-        self.assertIn(str(self.ain.resolve()), args)
+        self.assertEqual(Path(args[-1]).parent.parent, self.ain.parent.resolve())
+        self.assertNotEqual(Path(args[-1]), self.ain.resolve())
 
     def test_save_preserves_existing_sibling_temporary_file(self):
         sibling = self.ain.with_name(self.ain.name + ".ain-new")
         sibling.write_bytes(b"UNRELATED")
-        self.tools.edit_text(self.ain, 's[1] = "changed"\n', "CP936")
+        with patch.object(self.tools, "_verify_edited_text"):
+            self.tools.edit_text(self.ain, 's[1] = "changed"\n', "CP936")
         self.assertEqual(sibling.read_bytes(), b"UNRELATED")
         args = json.loads(self.log.read_text(encoding="utf-8"))
         output = Path(args[args.index("-o") + 1])
@@ -203,6 +250,25 @@ class AliceToolsTests(unittest.TestCase):
         self.assertEqual(self.ain.read_bytes(), b"ORIGINAL")
         self.assertFalse(self.ain.with_name(self.ain.name + ".bak").exists())
 
+    def test_invalid_system4_text_is_rejected_before_running_alice(self):
+        for text, encoding in (("hello", "UTF-16LE"), ("a" * 65_536, "UTF-8")):
+            with self.subTest(encoding=encoding), patch.object(self.tools, "run") as run:
+                with self.assertRaises(AliceError):
+                    self.tools.edit_text(self.ain, f'm[0] = "{text}"\n', encoding)
+                run.assert_not_called()
+                self.assertEqual(self.ain.read_bytes(), b"ORIGINAL")
+
+    def test_nonempty_output_with_unapplied_edit_does_not_replace_source(self):
+        data = b"MSG0" + struct.pack("<I", 1) + b"wrong\0"
+        with (
+            patch.object(self.tools, "map_dump", return_value=f"MSG0: 0 -> {len(data):x}"),
+            patch.object(self.tools, "decrypted_bytes", return_value=data),
+            self.assertRaisesRegex(AliceError, "与请求的修改不一致"),
+        ):
+            self.tools.edit_text(self.ain, 'm[0] = "expected"\n', "UTF-8")
+        self.assertEqual(self.ain.read_bytes(), b"ORIGINAL")
+        self.assertFalse(self.ain.with_suffix(".ain.bak").exists())
+
     def test_backup_failure_does_not_replace_source(self):
         with patch("aindiff.alice_tools.shutil.copy2", side_effect=OSError("backup failed")):
             with self.assertRaises(OSError):
@@ -228,7 +294,7 @@ class DownloadTests(unittest.TestCase):
             "aindiff.alice_tools._download", side_effect=download
         ):
             root = Path(td)
-            exe = download_alice(root)
+            exe = download_alice(root, expected_sha256=hashlib.sha256(b"executable").hexdigest())
             self.assertEqual(exe.read_bytes(), b"executable")
             self.assertEqual((exe.parent / "COPYING.txt").read_bytes(), b"license")
             self.assertTrue((root / f"alice-tools-{ALICE_RELEASE_TAG}.zip").is_file())
@@ -253,12 +319,12 @@ class DownloadTests(unittest.TestCase):
                     if mode == "missing":
                         archive.writestr("COPYING.txt", "license")
                     else:
-                        archive.writestr(exe.name, b"new executable")
+                        archive.writestr(exe.name, b"" if mode == "empty" else b"new executable")
                 if mode == "crc":
                     data = target.read_bytes().replace(b"new executable", b"bad executable")
                     target.write_bytes(data)
 
-            for mode in ("invalid", "missing", "crc"):
+            for mode in ("invalid", "missing", "crc", "empty", "wrong_hash"):
                 with self.subTest(mode=mode), patch(
                     "aindiff.alice_tools._download", side_effect=download
                 ):

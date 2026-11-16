@@ -1,5 +1,7 @@
+import os
 import struct
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -10,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from aindiff.alice_tools import AliceError  # noqa: E402
+from aindiff.file_state import FileRevision
 from aindiff.gui import AinDiffApp, _reattach_target  # noqa: E402
 from aindiff.model import AlignedRow, TextDump, TextEntry  # noqa: E402
 
@@ -36,6 +39,9 @@ class FakeTree:
 
     def get_children(self, parent=""):
         return tuple(self.attached)
+
+    def exists(self, item):
+        return item in self.items
 
     def insert(self, parent, position, **values):
         item = f"item{len(self.items)}"
@@ -97,6 +103,12 @@ class HeadlessApp(AinDiffApp):
         self.main_to_structure_item = {}
         self.structure_children_loaded = set()
         self.section_maps = {"left": [], "right": []}
+        self.file_revisions = {
+            side: Mock(spec=FileRevision, path=Path(f"{side}.ain"), size=100)
+            for side in ("left", "right")
+        }
+        self.loaded_encodings = {"left": "CP932", "right": "CP936"}
+        self._reload_primary = False
         self.search_hits = []
         self.search_index = -1
         self._search_query = None
@@ -106,7 +118,7 @@ class HeadlessApp(AinDiffApp):
         self.single_mode = False
         self._busy = False
         self._closing = False
-        self._filter_key = None
+        self._filter_key = ("", False)
         self._visible_items = set()
         self._item_section = {}
         self._section_visible_counts = {}
@@ -125,17 +137,20 @@ class HeadlessApp(AinDiffApp):
         self.text_left_dump = self.left_dump
         self.text_right_dump = self.right_dump
         self.tools = Mock()
-        self.tools.edit_text.return_value = ("left.ain", 100, 110)
+        self.tools.map_dump.return_value = "VERS: 0 -> 8"
+        self.tools.write_text.return_value = Mock(spec=FileRevision, path=Path("saved.ain"), size=110)
         self.update_idletasks = Mock()
         self._update_status = Mock()
 
-    def _start_read(self, work, finish, error_title="读取失败"):
+    def _start_job(self, work, finish, error_title="读取失败", *, after_error=None, writing=False):
         try:
             result = work()
         except Exception as exc:
             from aindiff.gui import messagebox
             messagebox.showerror(error_title, str(exc), parent=self)
             self.status_var.set(error_title)
+            if after_error is not None:
+                after_error()
             return False
         finish(result)
         return True
@@ -156,6 +171,7 @@ class HeadlessApp(AinDiffApp):
         }
         self._last_changed_count += int(row.changed)
         self.tree.attached.append(item)
+        self._visible_items.add(item)
         return row
 
     def pending_edit(self, item, text):
@@ -193,6 +209,14 @@ class ReattachTargetTests(unittest.TestCase):
 
 
 class GuiStateTests(unittest.TestCase):
+    def use_file(self, app, side):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        path = Path(temp.name).resolve() / f"{side}.ain"
+        path.write_bytes(b"synthetic")
+        getattr(app, f"{side}_var").set(str(path))
+        return path
+
     def large_app(self):
         app = HeadlessApp()
         for number in range(10001):
@@ -295,7 +319,7 @@ class GuiStateTests(unittest.TestCase):
         row.right.text = "right saved"
         with patch("aindiff.gui.messagebox.askyesno", return_value=True):
             app.save_all()
-        self.assertEqual(app.tools.edit_text.call_count, 2)
+        self.assertEqual(app.tools.write_text.call_count, 2)
         self.assertFalse(app.left_dump.dirty_count)
         self.assertFalse(app.right_dump.dirty_count)
         self.assertEqual(callbacks, [])
@@ -345,7 +369,7 @@ class GuiStateTests(unittest.TestCase):
         self.assertFalse(app.load_pair())
         self.assertFalse(app.save_side("left"))
         self.assertFalse(app._begin_edit("item0", "left"))
-        app.tools.edit_text.assert_not_called()
+        app.tools.write_text.assert_not_called()
         while callbacks:
             callbacks.pop(0)()
         self.assertFalse(app._busy)
@@ -369,7 +393,7 @@ class GuiStateTests(unittest.TestCase):
             release.wait(2)
             return "loaded"
 
-        AinDiffApp._start_read(app, work, lambda value: delivered.append((value, threading.get_ident())))
+        AinDiffApp._start_job(app, work, lambda value: delivered.append((value, threading.get_ident())))
         try:
             self.assertTrue(started.wait(1))
             self.assertTrue(app._busy)
@@ -391,7 +415,7 @@ class GuiStateTests(unittest.TestCase):
         app.after = lambda delay, callback: callbacks.append(callback)
         app._set_busy = lambda value: setattr(app, "_busy", value)
         finish = Mock()
-        AinDiffApp._start_read(app, lambda: "result", finish)
+        AinDiffApp._start_job(app, lambda: "result", finish)
         app._closing = True
         callbacks.pop(0)()
         finish.assert_not_called()
@@ -470,6 +494,7 @@ class GuiStateTests(unittest.TestCase):
         for item in ("a", "b", "c"):
             app.add_row(item)
         app.tree.detach("b")
+        app._visible_items.remove("b")
         app._reveal_main_item("b")
         self.assertEqual(app.tree.attached, ["a", "b", "c"])
         self.assertEqual(app.tree.focus(), "b")
@@ -519,7 +544,7 @@ class GuiStateTests(unittest.TestCase):
         with patch("aindiff.gui.messagebox.askyesno", return_value=True):
             app.save_all()
         editor._commit.assert_called_once()
-        self.assertIn('s[1] = "edited"', app.tools.edit_text.call_args.args[1])
+        self.assertIn('s[1] = "edited"', app.tools.write_text.call_args.args[1])
         self.assertFalse(row.left.dirty)
 
     def test_discard_checks_active_editor(self):
@@ -564,7 +589,7 @@ class GuiStateTests(unittest.TestCase):
         app = HeadlessApp()
         row = app.add_row("a")
         row.left.text = "edited"
-        app.tools.edit_text.side_effect = AliceError("failed")
+        app.tools.write_text.side_effect = AliceError("failed")
         with patch("aindiff.gui.messagebox.askyesno", return_value=True), patch(
             "aindiff.gui.messagebox.showerror"
         ):
@@ -576,7 +601,8 @@ class GuiStateTests(unittest.TestCase):
         row = app.add_row("old")
         previous_dump = app.left_dump
         app.right_var.set("")
-        with patch("aindiff.gui.Path.is_file", return_value=True), patch(
+        self.use_file(app, "left")
+        with patch(
             "aindiff.loading.open_dump", side_effect=OSError("failed")
         ), patch("aindiff.gui.messagebox.showerror"):
             self.assertFalse(app.load_pair())
@@ -587,7 +613,8 @@ class GuiStateTests(unittest.TestCase):
     def test_single_fallback_error_is_reported_once(self):
         app = HeadlessApp()
         app.right_var.set("")
-        with patch("aindiff.gui.Path.is_file", return_value=True), patch(
+        self.use_file(app, "left")
+        with patch(
             "aindiff.loading.open_dump", side_effect=AliceError("dump failed")
         ), patch(
             "aindiff.loading.load_text_section_with_fallback", side_effect=AliceError("fallback failed")
@@ -599,10 +626,11 @@ class GuiStateTests(unittest.TestCase):
     def test_single_fallback_preserves_explicit_encoding(self):
         app = HeadlessApp()
         app.right_var.set("")
+        self.use_file(app, "left")
         payload = b"MSG0" + struct.pack("<i", 1) + "あ".encode("CP932") + b"\0"
         app.tools.map_dump.return_value = f"MSG0: 00000000 -> {len(payload):08x}"
         app.tools.decrypted_bytes.return_value = payload
-        with patch("aindiff.gui.Path.is_file", return_value=True), patch(
+        with patch(
             "aindiff.loading.open_dump", side_effect=AliceError("dump failed")
         ), patch("aindiff.gui.load_section_map", return_value=[]), patch.object(app, "_set_active_view"):
             self.assertTrue(app.load_pair())
@@ -612,28 +640,31 @@ class GuiStateTests(unittest.TestCase):
 
     def test_single_fallback_rejects_bytes_invalid_in_explicit_encoding(self):
         app = HeadlessApp()
+        path = str(self.use_file(app, "left"))
         payload = b"MSG0" + struct.pack("<i", 1) + b"\x82\xa0\0"
         app.tools.map_dump.return_value = f"MSG0: 00000000 -> {len(payload):08x}"
         app.tools.decrypted_bytes.return_value = payload
         with self.assertRaises(ValueError):
             from aindiff.ain_sections import load_text_section_with_fallback
-            load_text_section_with_fallback(app.tools, "missing.ain", text_encodings=("UTF-8",))
+            load_text_section_with_fallback(app.tools, path, text_encodings=("UTF-8",))
 
     def test_pair_fallback_preserves_each_selected_encoding(self):
         app = HeadlessApp()
+        left_path = str(self.use_file(app, "left"))
+        right_path = str(self.use_file(app, "right"))
         payloads = {
-            "left.ain": b"MSG0" + struct.pack("<i", 1) + "あ".encode("CP932") + b"\0",
-            "right.ain": b"MSG0" + struct.pack("<i", 1) + "你好".encode("CP936") + b"\0",
+            left_path: b"MSG0" + struct.pack("<i", 1) + "あ".encode("CP932") + b"\0",
+            right_path: b"MSG0" + struct.pack("<i", 1) + "你好".encode("CP936") + b"\0",
         }
         app.tools.map_dump.side_effect = lambda path, encoding: (
             f"MSG0: 00000000 -> {len(payloads[path]):08x}"
         )
         app.tools.decrypted_bytes.side_effect = payloads.__getitem__
         from aindiff.loading import load_pair
-        with patch("aindiff.loading.Path.is_file", return_value=True), patch(
+        with patch(
             "aindiff.loading.open_dump", side_effect=AliceError("mixed")
         ):
-            left, right, _, _ = load_pair(app.tools, "left.ain", "right.ain", "CP932", "CP936", allow_explicit_fallback=True)
+            left, right, _, _ = load_pair(app.tools, left_path, right_path, "CP932", "CP936", allow_explicit_fallback=True)
         self.assertEqual((left.encoding, right.encoding), ("CP932", "CP936"))
         self.assertEqual((left.entries[0].text, right.entries[0].text), ("あ", "你好"))
 
@@ -645,6 +676,26 @@ class GuiStateTests(unittest.TestCase):
         row.left.text = "removed"
         app.on_cell_edited("a", "left", row.left)
         self.assertEqual(app.tree.attached, [])
+
+    def test_edit_keeps_search_separate_from_applied_filter(self):
+        app = HeadlessApp()
+        row = app.add_row("a", left="other", right="other")
+        app.add_row("b", left="match", right="match")
+        app.search_var.set("match")
+        app.find_next()
+        row.left.text = "edited"
+        app.on_cell_edited("a", "left", row.left)
+        self.assertEqual(app.tree.attached, ["a", "b"])
+        self.assertEqual(app._filter_key, ("", False))
+
+    def test_single_mode_ignores_difference_filter(self):
+        app = HeadlessApp()
+        app.single_mode = True
+        app.add_row("a")
+        app.diff_only_var.set(True)
+        app._apply_diff_filter()
+        self.assertEqual(app.tree.attached, ["a"])
+        self.assertFalse(app.diff_only_var.get())
 
     def test_edit_hides_equal_row_with_both_filters_active(self):
         app = HeadlessApp()
@@ -659,17 +710,41 @@ class GuiStateTests(unittest.TestCase):
     def test_single_right_file_uses_its_selected_encoding(self):
         app = HeadlessApp()
         app.left_var.set("")
-        loaded = TextDump("right.ain", "CP936")
-        with patch("aindiff.gui.Path.is_file", return_value=True), patch(
+        path = str(self.use_file(app, "right"))
+        loaded = TextDump(path, "CP936")
+        with patch(
             "aindiff.loading.open_dump", return_value=loaded
         ) as open_dump, patch("aindiff.gui.load_section_map", return_value=[]), patch.object(
             app, "_set_active_view"
         ):
             self.assertTrue(app.load_pair())
-        open_dump.assert_called_once_with(app.tools, "right.ain", "CP936")
+        open_dump.assert_called_once_with(app.tools, path, "CP936")
         self.assertEqual(app.left_enc_var.get(), "CP936")
-        self.assertEqual(app.left_var.get(), "right.ain")
+        self.assertEqual(app.left_var.get(), path)
         self.assertEqual(app.right_var.get(), "")
+
+    def test_gui_rejects_both_sides_pointing_to_same_file(self):
+        app = HeadlessApp()
+        path = self.use_file(app, "left")
+        app.right_var.set(str(path))
+        with patch("aindiff.gui.read_pair") as read_pair, patch("aindiff.gui.messagebox.showerror") as error:
+            self.assertFalse(app.load_pair())
+        read_pair.assert_not_called()
+        self.assertIn("左右指向同一个文件", error.call_args.args[1])
+
+    def test_gui_rejects_hard_link_aliases(self):
+        app = HeadlessApp()
+        path = self.use_file(app, "left")
+        alias = path.with_name("alias.ain")
+        try:
+            os.link(path, alias)
+        except OSError as exc:
+            self.skipTest(f"hard links unavailable: {exc}")
+        app.right_var.set(str(alias))
+        with patch("aindiff.gui.read_pair") as read_pair, patch("aindiff.gui.messagebox.showerror") as error:
+            self.assertFalse(app.load_pair())
+        read_pair.assert_not_called()
+        self.assertIn("左右指向同一个文件", error.call_args.args[1])
 
     def test_switching_back_does_not_restore_discarded_cached_edits(self):
         app = HeadlessApp()
@@ -695,6 +770,8 @@ class GuiStateTests(unittest.TestCase):
         from aindiff.ain_sections import SectionInfo
 
         app = HeadlessApp()
+        app.text_left_dump.path = str(self.use_file(app, "left"))
+        app.text_right_dump.path = str(self.use_file(app, "right"))
         app.section_maps = {
             "left": [SectionInfo("MSG0", 0, 14)],
             "right": [SectionInfo("MSG1", 0, 21)],
@@ -702,8 +779,8 @@ class GuiStateTests(unittest.TestCase):
         message = b"hello"
         encoded = bytes((byte + i + 0x60) & 255 for i, byte in enumerate(message))
         tables = {
-            "left.ain": b"MSG0" + struct.pack("<i", 1) + message + b"\0",
-            "right.ain": b"MSG1" + struct.pack("<iii", 1, 0, len(encoded)) + encoded,
+            app.text_left_dump.path: b"MSG0" + struct.pack("<i", 1) + message + b"\0",
+            app.text_right_dump.path: b"MSG1" + struct.pack("<iii", 1, 0, len(encoded)) + encoded,
         }
         app.tools.map_dump.side_effect = lambda path, enc: (
             f"{tables[path][:4].decode()}: 00000000 -> {len(tables[path]):08x}"
@@ -741,7 +818,9 @@ class GuiStateTests(unittest.TestCase):
         app.pending_edit("a", "keep this")
         previous_dump = app.left_dump
         previous_view = app.current_view
+        app.text_left_dump.path = str(self.use_file(app, "left"))
         app.text_left_dump.encoding = "CP936"
+        app.loaded_encodings["left"] = "CP936"
         payload = b"STR0" + struct.pack("<i", 1) + "ｱ".encode("CP932") + b"\0"
         app.tools.map_dump.return_value = f"STR0: 00000000 -> {len(payload):08x}"
         app.tools.decrypted_bytes.return_value = payload
@@ -755,6 +834,17 @@ class GuiStateTests(unittest.TestCase):
         self.assertEqual(app.current_view, previous_view)
         self.assertEqual(row.left.text, "keep this")
         self.assertTrue(row.left.dirty)
+
+    def test_save_does_not_overwrite_peer_opened_from_backup(self):
+        app = HeadlessApp()
+        app.file_revisions["right"].path = app.file_revisions["left"].path.with_suffix(".ain.bak")
+        row = app.add_row("a")
+        row.left.text = "keep this edit"
+        with patch("aindiff.gui.messagebox.showerror") as error:
+            self.assertFalse(app.save_side("left"))
+        self.assertIn("正在对照", error.call_args.args[0])
+        self.assertTrue(row.left.dirty)
+        app.tools.write_text.assert_not_called()
 
 
 if __name__ == "__main__":

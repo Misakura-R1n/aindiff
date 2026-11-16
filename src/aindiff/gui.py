@@ -16,11 +16,14 @@ from typing import Dict, List, Optional
 from . import ALICE_TOOLS_URL, APP_NAME, __version__
 from .ain_sections import (
     SectionInfo,
+    TEXT_SECTION_GROUPS,
     TEXT_SECTION_KINDS,
     load_section_dump,
     load_section_map,
+    load_text_section_with_fallback,
 )
-from .alice_tools import AliceError, AliceNotFound, AliceTools
+from .alice_tools import AliceError, AliceTools
+from .file_state import FileRevision
 from .loading import load_pair as read_pair, open_dump_with_fallback
 from .model import (
     AlignedRow,
@@ -73,7 +76,8 @@ def _reattach_target(item_order: List[str], attached: set[str], main_item: str) 
         target_index = item_order.index(main_item)
     except ValueError:
         return ""
-    for later_item in item_order[target_index + 1 :]:
+    for index in range(target_index + 1, len(item_order)):
+        later_item = item_order[index]
         if later_item in attached:
             return later_item
     return ""
@@ -186,8 +190,7 @@ class AinDiffApp(tk.Tk):
                 tkfont.nametofont(name).configure(family="Microsoft YaHei UI", size=10)
         ttk.Style(self).configure("Treeview", rowheight=default_font.metrics("linespace") + 8)
 
-        self.alice_path = alice
-        self.tools: Optional[AliceTools] = None
+        self.tools = AliceTools(alice)
         self.left_dump: Optional[TextDump] = None
         self.right_dump: Optional[TextDump] = None
         self.text_left_dump: Optional[TextDump] = None
@@ -195,16 +198,20 @@ class AinDiffApp(tk.Tk):
         self.current_view = _TEXT_VIEW
         self.single_mode = False
         self._busy = False
+        self._writing = False
         self._closing = False
         self._job_poll = None
         self._render_after = None
         self._scan_after = None
         self._disabled_controls = []
-        self._filter_key = None
+        self._filter_key = ("", False)
         self._visible_items = set()
         self._item_section = {}
         self._section_visible_counts = {}
         self.section_maps: Dict[str, List[SectionInfo]] = {"left": [], "right": []}
+        self.file_revisions: dict[str, FileRevision] = {}
+        self.loaded_encodings: dict[str, Optional[str]] = {}
+        self._reload_primary = False
         self.rows: List[AlignedRow] = []
         self.rows_by_item: Dict[str, AlignedRow] = {}
         self.item_order: List[str] = []
@@ -228,7 +235,7 @@ class AinDiffApp(tk.Tk):
         self.diff_only_var = tk.BooleanVar(value=False)
         self.search_var = tk.StringVar()
         self.search_status_var = tk.StringVar()
-        self.status_var = tk.StringVar(value="正在初始化 alice-tools ...")
+        self.status_var = tk.StringVar(value="请选择要打开的 AIN 文件")
 
         self._build_menu()
         self._build_toolbar()
@@ -236,14 +243,6 @@ class AinDiffApp(tk.Tk):
         self._build_main_pane()
         self._build_statusbar()
         self._bind_shortcuts()
-
-        try:
-            self.tools = AliceTools(self.alice_path) if self.alice_path else AliceTools()
-        except AliceNotFound as exc:
-            self.status_var.set("未找到 alice-tools")
-            messagebox.showerror("缺少 alice-tools", str(exc), parent=self)
-        else:
-            self.status_var.set(f"alice-tools：{self.tools.executable}")
 
         if left or right:
             self.after(150, self.load_pair)
@@ -280,8 +279,8 @@ class AinDiffApp(tk.Tk):
         view_menu.add_command(label="显示 / 隐藏结构栏", command=self.toggle_structure)
         view_menu.add_command(label="展开全部结构", command=self.expand_all_structure)
         view_menu.add_separator()
-        view_menu.add_checkbutton(label="仅显示差异行", variable=self.diff_only_var, command=self.apply_filter)
-        view_menu.add_command(label="显示全部行", command=lambda: (self.diff_only_var.set(False), self.apply_filter()))
+        view_menu.add_checkbutton(label="仅显示差异行", variable=self.diff_only_var, command=self._apply_diff_filter)
+        view_menu.add_command(label="关闭差异筛选", command=lambda: (self.diff_only_var.set(False), self._apply_diff_filter()))
         menubar.add_cascade(label="视图", menu=view_menu)
 
         help_menu = tk.Menu(menubar, tearoff=False)
@@ -314,7 +313,7 @@ class AinDiffApp(tk.Tk):
         actions = ttk.Frame(bar, padding=(0, 6, 0, 0))
         actions.grid(row=2, column=0, columnspan=6, sticky="ew")
         ttk.Button(actions, text="查找（Ctrl+F）", command=self.focus_search).pack(side="left")
-        ttk.Checkbutton(actions, text="仅显示差异", variable=self.diff_only_var, command=self.apply_filter).pack(side="left", padx=12)
+        ttk.Checkbutton(actions, text="仅显示差异", variable=self.diff_only_var, command=self._apply_diff_filter).pack(side="left", padx=12)
         ttk.Checkbutton(actions, text="保存前备份 .bak", variable=self.backup_var).pack(side="left")
         ttk.Button(actions, text="全部保存（Ctrl+S）", command=self.save_all).pack(side="right")
 
@@ -508,8 +507,9 @@ class AinDiffApp(tk.Tk):
                     widget.state(["!disabled"])
             self._disabled_controls.clear()
 
-    def _start_read(self, work, finish, error_title="读取失败") -> bool:
-        """Run file work off the Tk thread; deliver results only on the Tk thread."""
+    def _start_job(self, work, finish, error_title="读取失败", *, after_error=None, writing=False) -> bool:
+        """Run file work off the Tk thread and deliver its result on that thread."""
+        self._writing = writing
         self._set_busy(True)
         results = queue.Queue(maxsize=1)
 
@@ -528,14 +528,17 @@ class AinDiffApp(tk.Tk):
             except queue.Empty:
                 self._job_poll = self.after(40, poll)
                 return
+            self._writing = False
             self._set_busy(False)
             if error is not None:
                 messagebox.showerror(error_title, str(error), parent=self)
                 self.status_var.set(error_title)
+                if after_error is not None:
+                    after_error()
                 return
             finish(result)
 
-        threading.Thread(target=read, daemon=True).start()
+        threading.Thread(target=read).start()
         self._job_poll = self.after(40, poll)
         return True
 
@@ -546,8 +549,6 @@ class AinDiffApp(tk.Tk):
         right = self.right_var.get().strip()
         if not left and not right:
             messagebox.showinfo("提示", "请至少选择一个 .ain 文件。", parent=self)
-            return False
-        if self.tools is None:
             return False
         if not force and not self._confirm_discard_changes():
             return False
@@ -565,17 +566,22 @@ class AinDiffApp(tk.Tk):
         tools = self.tools
 
         def read():
+            revisions = {side: FileRevision.capture(path) for side, path in present}
             if single_mode:
-                side, path = present[0]
+                side, _ = present[0]
+                revision = revisions[side]
                 left_dump, note = open_dump_with_fallback(
-                    tools, path, encodings[side], allow_explicit_fallback=True
+                    tools, str(revision.path), encodings[side], allow_explicit_fallback=True
                 )
+                revisions = {"left": revision}
                 right_dump = TextDump("", "")
                 rows = align_dumps(left_dump, right_dump)
                 notes = [note] if note else []
             else:
+                if revisions["left"].same_file(revisions["right"]):
+                    raise AliceError("左右指向同一个文件。请只保留一侧路径后重新加载。")
                 left_dump, right_dump, rows, notes = read_pair(
-                    tools, present[0][1], present[1][1],
+                    tools, str(revisions["left"].path), str(revisions["right"].path),
                     encodings["left"], encodings["right"], allow_explicit_fallback=True,
                 )
             maps = {
@@ -588,22 +594,28 @@ class AinDiffApp(tk.Tk):
                 maps["right"] = load_section_map(
                     tools, right_dump.path, (right_dump.encoding, "CP932", "CP936", "UTF-8")
                 )
-            return left_dump, right_dump, rows, notes, maps
+            for revision in revisions.values():
+                revision.check()
+            return left_dump, right_dump, rows, notes, maps, revisions
 
         def loaded(result):
-            left_dump, right_dump, rows, notes, maps = result
+            left_dump, right_dump, rows, notes, maps, revisions = result
             self.single_mode = single_mode
             self.left_var.set(left_dump.path)
             self.right_var.set(right_dump.path)
             if single_mode:
                 self.left_enc_var.set(encodings[present[0][0]] or _ENCODINGS[0])
+                self.diff_only_var.set(False)
             self.section_maps = maps
+            self.file_revisions = revisions
+            self.loaded_encodings = {"left": encodings[present[0][0]]} if single_mode else encodings
+            self._reload_primary = False
             self.text_left_dump = left_dump
             self.text_right_dump = None if single_mode else right_dump
             self._set_active_view(left_dump, right_dump, notes[0] if notes else _TEXT_VIEW, rows=rows)
 
         self.status_var.set("正在读取并解析 AIN 文本节 ...")
-        return self._start_read(read, loaded)
+        return self._start_job(read, loaded)
 
     def _set_active_view(
         self,
@@ -628,31 +640,51 @@ class AinDiffApp(tk.Tk):
             return
         if not self._confirm_discard_changes():
             return
-        assert self.tools is not None and self.text_left_dump is not None
+        assert self.text_left_dump is not None
         tools = self.tools
         left_cached, right_cached = self.text_left_dump, self.text_right_dump
+        revisions = tuple(self.file_revisions.values())
 
         def section_for(side):
             available = {section.name for section in self.section_maps[side]}
             if view_name in available:
                 return view_name
-            aliases = ("MSG0", "MSG1", "MSGI") if view_name in (
-                "MSG0", "MSG1", "MSGI"
-            ) else ("STR0", "VARI")
+            aliases = next(group for group in TEXT_SECTION_GROUPS if view_name in group)
             return next((name for name in aliases if name in available), view_name)
 
-        left_section, right_section = section_for("left"), section_for("right")
+        def raw_section(side, cached):
+            name = section_for(side)
+            explicit_encoding = self.loaded_encodings.get(side)
+            if explicit_encoding is not None:
+                return load_section_dump(tools, cached.path, name, explicit_encoding)
+            return load_text_section_with_fallback(
+                tools, cached.path, section_name=name,
+                text_encodings=(cached.encoding, "CP932", "CP936", "UTF-8", "BIG5"),
+                map_encodings=(cached.encoding, "CP932", "CP936", "UTF-8", "ISO-8859-1"),
+            )
 
         def read():
-            if view_name == _TEXT_VIEW:
-                left_raw, right_raw = left_cached, right_cached or TextDump("", "")
-            else:
-                left_raw = load_section_dump(tools, left_cached.path, left_section, left_cached.encoding)
-                right_raw = (
-                    load_section_dump(tools, right_cached.path, right_section, right_cached.encoding)
-                    if right_cached is not None else TextDump("", "")
+            if view_name == _TEXT_VIEW and self._reload_primary and right_cached is not None:
+                left_raw, right_raw, rows, _ = read_pair(
+                    tools, left_cached.path, right_cached.path,
+                    self.loaded_encodings["left"], self.loaded_encodings["right"],
+                    allow_explicit_fallback=True,
                 )
-            return left_raw, right_raw, align_dumps(left_raw, right_raw)
+            elif view_name == _TEXT_VIEW:
+                left_raw, right_raw = left_cached, right_cached or TextDump("", "")
+                if self._reload_primary:
+                    left_raw, _ = open_dump_with_fallback(
+                        tools, left_cached.path, self.loaded_encodings["left"],
+                        allow_explicit_fallback=True,
+                    )
+                rows = align_dumps(left_raw, right_raw)
+            else:
+                left_raw = raw_section("left", left_cached)
+                right_raw = raw_section("right", right_cached) if right_cached is not None else TextDump("", "")
+                rows = align_dumps(left_raw, right_raw)
+            for revision in revisions:
+                revision.check()
+            return left_raw, right_raw, rows
 
         def loaded(result):
             left_raw, right_raw, rows = result
@@ -664,10 +696,14 @@ class AinDiffApp(tk.Tk):
                     self._update_status()
                     return
             self._discard_active_edits()
+            if view_name == _TEXT_VIEW:
+                self.text_left_dump = left_raw
+                self.text_right_dump = None if self.single_mode else right_raw
+                self._reload_primary = False
             self._set_active_view(left_raw, right_raw, view_name, rows=rows)
 
         self.status_var.set("正在读取文本视图 ...")
-        self._start_read(read, loaded, "区段读取失败")
+        self._start_job(read, loaded, "区段读取失败")
 
     def _discard_active_edits(self) -> None:
         """Reset outgoing edits only after a view switch can proceed."""
@@ -684,7 +720,9 @@ class AinDiffApp(tk.Tk):
             if section is not None:
                 lines.append(f"{label}：{section.describe()}")
         lines.append("")
-        lines.append("可直接编辑的文本区段：MSG0、MSG1、STR0。")
+        names = [section.name for section in self._all_ain_sections() if section.name in TEXT_SECTION_KINDS]
+        if names:
+            lines.append("可直接编辑的文本区段：" + "、".join(names))
         messagebox.showinfo("AIN 区段", chr(10).join(lines), parent=self)
 
     def _clear_rows(self) -> None:
@@ -707,7 +745,6 @@ class AinDiffApp(tk.Tk):
         self._search_query = None
         self._search_positions.clear()
         self.search_status_var.set("")
-        self._filter_key = None
         self._visible_items.clear()
         self._item_section.clear()
         self._section_visible_counts.clear()
@@ -728,7 +765,7 @@ class AinDiffApp(tk.Tk):
                 if row is None:
                     self._populate_structure_tree()
                     self._set_busy(False)
-                    self.apply_filter()
+                    self.apply_filter(use_search=False)
                     return
                 self._insert_row(row)
                 inserted += 1
@@ -791,25 +828,35 @@ class AinDiffApp(tk.Tk):
                         label = f"{row.section_no}. L:{left_name} | R:{right_name}"
                     iid = f"sec:{row.section_no}"
                     self.structure_tree.insert(_TEXT_ROOT, "end", iid=iid, text=label, open=False)
+                    self.structure_tree.insert(iid, "end", iid=f"{iid}:placeholder")
                 else:
                     self.section_rows.setdefault(row.section_no, []).append(row)
 
         self.structure_tree.insert("", "end", iid=_AIN_ROOT, text="AIN 区段", open=True)
-        for section in self._all_ain_sections():
-            editable = section.name in TEXT_SECTION_KINDS
-            label = f"{section.name}{'（可编辑）' if editable else ''}  0x{section.start:08x}  {section.size:,}B"
-            self.structure_tree.insert(
-                _AIN_ROOT,
-                "end",
-                iid=f"ainsec:{section.name}",
-                text=label,
-                tags=("struct_dirty",) if editable else (),
-            )
+        self._refresh_ain_nodes()
         if self.current_view != _TEXT_VIEW:
             iid = f"ainsec:{self.current_view}"
             if self.structure_tree.exists(iid):
                 self.structure_tree.selection_set(iid)
                 self.structure_tree.see(iid)
+
+    def _refresh_ain_nodes(self) -> None:
+        if not self.structure_tree.exists(_AIN_ROOT):
+            return
+        previous = set(self.structure_tree.get_children(_AIN_ROOT))
+        for section in self._all_ain_sections():
+            editable = section.name in TEXT_SECTION_KINDS
+            iid = f"ainsec:{section.name}"
+            label = f"{section.name}{'（可编辑）' if editable else ''}  0x{section.start:08x}  {section.size:,}B"
+            if iid in previous:
+                self.structure_tree.item(iid, text=label)
+                previous.remove(iid)
+            else:
+                self.structure_tree.insert(
+                    _AIN_ROOT, "end", iid=iid, text=label, tags=("struct_dirty",) if editable else (),
+                )
+        if previous:
+            self.structure_tree.delete(*previous)
 
     def _all_ain_sections(self) -> List[SectionInfo]:
         names: List[str] = []
@@ -828,6 +875,7 @@ class AinDiffApp(tk.Tk):
     def _ensure_structure_children(self, section_iid: str) -> None:
         if section_iid in self.structure_children_loaded:
             return
+        self.structure_tree.delete(f"{section_iid}:placeholder")
         sec_no = int(section_iid.split(":", 1)[1])
         for row in self.section_rows.get(sec_no, []):
             # main item id for this row
@@ -851,9 +899,9 @@ class AinDiffApp(tk.Tk):
     def on_structure_open(self, _event: object = None) -> None:
         if self._busy:
             return
-        selected = self.structure_tree.selection()
-        if selected and selected[0].startswith("sec:"):
-            self._ensure_structure_children(selected[0])
+        item = self.structure_tree.focus()
+        if item.startswith("sec:"):
+            self._ensure_structure_children(item)
 
     def on_structure_select(self, _event: object = None) -> None:
         if self._busy:
@@ -924,7 +972,7 @@ class AinDiffApp(tk.Tk):
             self.structure_tree.item(_TEXT_ROOT, open=True)
         if self.structure_tree.exists(_AIN_ROOT):
             self.structure_tree.item(_AIN_ROOT, open=True)
-        if self.current_view == _TEXT_VIEW:
+        if self.structure_tree.exists(_TEXT_ROOT):
             for section_iid in self.structure_tree.get_children(_TEXT_ROOT):
                 self._ensure_structure_children(section_iid)
                 self.structure_tree.item(section_iid, open=True)
@@ -936,7 +984,7 @@ class AinDiffApp(tk.Tk):
         table, which is the bug fixed here: we look for the next item in the
         original insertion order that is still visible and insert before it.
         """
-        attached = set(self.tree.get_children(""))
+        attached = self._visible_items
         if main_item not in attached:
             next_item = _reattach_target(self.item_order, attached, main_item)
             position = self.tree.index(next_item) if next_item else "end"
@@ -946,10 +994,11 @@ class AinDiffApp(tk.Tk):
             if section is not None:
                 self._section_visible_counts[section] += 1
                 if section not in attached:
-                    next_item = _reattach_target(self.item_order, attached | {main_item}, section)
+                    next_item = _reattach_target(self.item_order, attached, section)
                     position = self.tree.index(next_item) if next_item else "end"
                     self.tree.reattach(section, "", position)
                     self._visible_items.add(section)
+            self._update_status()
         self.tree.see(main_item)
         self.tree.selection_set(main_item)
         self.tree.focus(main_item)
@@ -980,7 +1029,7 @@ class AinDiffApp(tk.Tk):
         if self.left_dump is None:
             return
         left_dirty = self.left_dump.dirty_count
-        visible = len(self.tree.get_children())
+        visible = len(self._visible_items)
         if self.right_dump is not None and self.right_dump.path:
             right_info = (
                 f"右 {Path(self.right_dump.path).name}"
@@ -1064,12 +1113,17 @@ class AinDiffApp(tk.Tk):
         self.status_var.set(f"{label} ...")
         self._scan_after = self.after(1, batch)
 
-    def apply_filter(self, *, background: bool = True) -> None:
+    def _apply_diff_filter(self) -> None:
+        if self.single_mode:
+            self.diff_only_var.set(False)
+        self.apply_filter(use_search=False)
+
+    def apply_filter(self, *, background: bool = True, use_search: bool = True) -> None:
         if self._busy:
             return
         self._commit_editor()
-        query = normalize_search_text(self.search_var.get().strip())
-        diff_only = self.diff_only_var.get()
+        query = normalize_search_text(self.search_var.get().strip()) if use_search else self._filter_key[0]
+        diff_only = self.diff_only_var.get() and not self.single_mode
         matching_items = (
             set(self.search_hits) if query and query == self._search_query else None
         )
@@ -1236,36 +1290,12 @@ class AinDiffApp(tk.Tk):
         row = self.rows_by_item.get(item)
         if row is None:
             return
-        values = list(self.tree.item(item, "values"))
-        values[_ROW_COLUMNS.index(column)] = display_text(entry.text)
-        self.tree.item(item, values=values)
-
-        tags = list(self.tree.item(item, "tags"))
-        self._last_changed_count += int(self._row_changed(row)) - int(
-            "changed" in tags or "missing" in tags
-        )
-        if (row.left and row.left.dirty) or (row.right and row.right.dirty):
-            if "dirty" not in tags:
-                tags.append("dirty")
-        elif "dirty" in tags:
-            tags.remove("dirty")
-        if not row.is_section:
-            if self._row_changed(row):
-                if "changed" not in tags and "missing" not in tags:
-                    tags.append("changed")
-            else:
-                if "changed" in tags:
-                    tags.remove("changed")
-        self.tree.item(item, tags=tags)
-        query = normalize_search_text(self.search_var.get().strip())
-        if (self.diff_only_var.get() and not self._row_changed(row)) or (
+        self._update_text_row(item, column, entry, row)
+        query, diff_only = self._filter_key
+        if (diff_only and not self._row_changed(row)) or (
             query and not self._row_matches(row, query)
         ):
-            if self._filter_key != (query, self.diff_only_var.get()):
-                # Editor commits can be part of save/load/search; finish this
-                # exceptional query change before the enclosing action resumes.
-                self.apply_filter(background=False)
-            elif item in self._visible_items:
+            if item in self._visible_items:
                 self.tree.detach(item)
                 self._visible_items.remove(item)
                 section = self._item_section.get(item)
@@ -1274,19 +1304,33 @@ class AinDiffApp(tk.Tk):
                     if not self._section_visible_counts[section]:
                         self.tree.detach(section)
                         self._visible_items.discard(section)
-        self._update_structure_node(item)
         self._update_status()
+
+    def _update_text_row(self, item: str, column: str, entry: TextEntry, row: AlignedRow) -> None:
+        values = list(self.tree.item(item, "values"))
+        values[_ROW_COLUMNS.index(column)] = display_text(entry.text)
+        tags = list(self.tree.item(item, "tags"))
+        changed = self._row_changed(row)
+        self._last_changed_count += int(changed) - int("changed" in tags or "missing" in tags)
+        if (row.left and row.left.dirty) or (row.right and row.right.dirty):
+            if "dirty" not in tags:
+                tags.append("dirty")
+        elif "dirty" in tags:
+            tags.remove("dirty")
+        if changed and "changed" not in tags and "missing" not in tags:
+            tags.append("changed")
+        elif not changed and "changed" in tags:
+            tags.remove("changed")
+        self.tree.item(item, values=values, tags=tags)
+        self._update_structure_node(item)
 
     # ------------------------------------------------------------------
     # saving back to the original files
     # ------------------------------------------------------------------
-    def save_side(self, side: str) -> bool:
+    def save_side(self, side: str, *, after=None) -> bool:
         if self._busy:
             return False
         self._commit_editor()
-        if self.tools is None:
-            messagebox.showerror("错误", "alice-tools 不可用。", parent=self)
-            return False
         if self.single_mode and side == "right":
             messagebox.showinfo("提示", "当前是单文件模式，请使用“保存左侧”。", parent=self)
             return False
@@ -1304,7 +1348,18 @@ class AinDiffApp(tk.Tk):
             messagebox.showerror("无法保存", str(exc), parent=self)
             return False
 
-        backup_note = "将先备份为 .bak。" if self.backup_var.get() else "不会创建备份。"
+        backup = self.backup_var.get()
+        source = self.file_revisions[side]
+        peer = self.file_revisions.get("right" if side == "left" else "left")
+        backup_path = source.path.with_name(source.path.name + ".bak")
+        if backup and peer is not None and backup_path == peer.path:
+            messagebox.showerror(
+                "备份路径正在对照",
+                f"写回会覆盖另一侧正在对照的文件：{backup_path}\n请更换对照文件或关闭本次备份。",
+                parent=self,
+            )
+            return False
+        backup_note = "将备份为 .bak。" if backup else "不会创建备份。"
         ok = messagebox.askyesno(
             "确认写回原文件",
             f"即将把 {len(dirty)} 处修改写回：\n{dump.path}\n\n{backup_note}\n是否继续？",
@@ -1314,83 +1369,80 @@ class AinDiffApp(tk.Tk):
             return False
 
         self.status_var.set(f"正在写回 {Path(dump.path).name} ...")
-        self.update_idletasks()
-        try:
-            _, old_size, new_size = self.tools.edit_text(
-                dump.path,
+        tools = self.tools
+
+        def write():
+            written = tools.write_text(
+                source,
                 edit_text,
                 dump.encoding,
-                backup=self.backup_var.get(),
+                backup_suffix=".bak" if backup else None,
             )
-        except AliceError as exc:
-            messagebox.showerror("写回失败", str(exc), parent=self)
-            self.status_var.set("写回失败")
-            return False
-        except OSError as exc:
-            messagebox.showerror("写回失败", str(exc), parent=self)
-            self.status_var.set("写回失败")
-            return False
+            try:
+                section_map = load_section_map(
+                    tools, str(written.path), (dump.encoding, "CP932", "CP936", "UTF-8", "ISO-8859-1"),
+                )
+                written.check()
+            except (AliceError, OSError, ValueError):
+                section_map = None
+            return written, section_map
 
-        # AIN stores each s/m id once; every occurrence (and cached text
-        # view) must reflect the value that was actually written.
-        saved_values = {entry.id_key: entry.text for entry in dirty}
-        cached = self.text_left_dump if side == "left" else self.text_right_dump
-        for saved_dump in (dump, cached):
-            if saved_dump is None:
-                continue
-            for entry in saved_dump.entries:
-                if entry.id_key in saved_values:
-                    entry.text = saved_values[entry.id_key]
-                    entry.original_text = entry.text
-        self._refresh_after_save()
-        self.status_var.set(
-            f"已写回 {Path(dump.path).name}：{len(dirty)} 处修改，"
-            f"{old_size} -> {new_size} 字节。"
-        )
-        return True
+        def saved(result):
+            written, section_map = result
+            self.file_revisions[side] = written
+            self.section_maps[side] = section_map or []
+            self._refresh_ain_nodes()
+            # All references to the saved table ID must reflect the write.
+            saved_values = {entry.id_key: entry.text for entry in dirty}
+            cached = self.text_left_dump if side == "left" else self.text_right_dump
+            for saved_dump in (dump, cached):
+                if saved_dump is None:
+                    continue
+                if saved_dump.encoding != dump.encoding:
+                    if any(entry.id_key in saved_values for entry in saved_dump.entries):
+                        self._reload_primary = True
+                    continue
+                for entry in saved_dump.entries:
+                    if entry.id_key in saved_values:
+                        entry.text = saved_values[entry.id_key]
+                        entry.original_text = entry.text
+            self._refresh_after_save(side, set(saved_values))
+            map_note = " 区段表需重新加载。" if section_map is None else ""
+            self.status_var.set(
+                f"已写回 {Path(dump.path).name}：{len(dirty)} 处修改，"
+                f"{source.size} -> {written.size} 字节。{map_note}"
+            )
+            if after is not None:
+                after()
+
+        return self._start_job(write, saved, "写回失败", after_error=after, writing=True)
 
     def save_all(self) -> None:
         if self._busy:
             return
         self._commit_editor()
-        saved = 0
-        for side in ("left", "right"):
-            dump = self.left_dump if side == "left" else self.right_dump
-            if dump is None:
-                continue
-            if dump.dirty_count:
-                saved += 1 if self.save_side(side) else 0
-        if saved:
-            self._update_status()
+        sides = iter(
+            side for side, dump in (("left", self.left_dump), ("right", self.right_dump))
+            if dump is not None and dump.dirty_count
+        )
 
-    def _refresh_after_save(self) -> None:
-        """Rebuild every row's tags from the current model state."""
+        def save_next():
+            for side in sides:
+                if self.save_side(side, after=save_next):
+                    return
+
+        save_next()
+
+    def _refresh_after_save(self, side: str, saved_ids: set[tuple[str, int]]) -> None:
+        """Update the rows that reference a saved table ID."""
         self._search_query = None
-        self._last_changed_count = 0
         for item, row in self.rows_by_item.items():
-            if row.is_section:
-                self.tree.item(item, tags=("section",))
-                continue
-            tags: List[str] = []
-            if (row.left is None or row.right is None) and not self.single_mode:
-                tags.append("missing")
-            elif self._row_changed(row):
-                tags.append("changed")
-            if self._row_changed(row):
-                self._last_changed_count += 1
-            if (row.left is not None and row.left.dirty) or (
-                row.right is not None and row.right.dirty
-            ):
-                tags.append("dirty")
-            values = list(self.tree.item(item, "values"))
-            for side, entry in (("left", row.left), ("right", row.right)):
-                if entry is not None:
-                    values[_ROW_COLUMNS.index(side)] = display_text(entry.text)
-            self.tree.item(item, values=values, tags=tuple(tags))
-            self._update_structure_node(item)
+            entry = row.left if side == "left" else row.right
+            if entry is not None and entry.id_key in saved_ids:
+                self._update_text_row(item, side, entry, row)
         # save_all may immediately save the other side; do not start a scan
         # that would mark the application busy halfway through that operation.
-        self.apply_filter(background=False)
+        self.apply_filter(background=False, use_search=False)
 
     # ------------------------------------------------------------------
     # misc
@@ -1407,6 +1459,9 @@ class AinDiffApp(tk.Tk):
         )
 
     def destroy(self) -> None:
+        if self._writing:
+            messagebox.showinfo("正在保存", "写回结束后即可退出。", parent=self)
+            return
         self._commit_editor()
         if (
             (self.left_dump is not None and self.left_dump.dirty_count)
@@ -1415,6 +1470,7 @@ class AinDiffApp(tk.Tk):
             if not messagebox.askyesno("退出", "存在未保存的修改，确定退出吗？", parent=self):
                 return
         self._closing = True
+        self.tools.close()
         for callback in (self._job_poll, self._render_after, self._scan_after):
             if callback is not None:
                 self.after_cancel(callback)

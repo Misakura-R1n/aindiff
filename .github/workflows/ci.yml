@@ -11,6 +11,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
         python: ["3.9", "3.11", "3.13"]
+        exclude:
+          - os: ubuntu-latest
+            python: "3.9"
+        include:
+          # Python 3.9 binaries are available for Ubuntu 24.04.
+          - os: ubuntu-24.04
+            python: "3.9"
     runs-on: ${{ matrix.os }}
 
     steps:
